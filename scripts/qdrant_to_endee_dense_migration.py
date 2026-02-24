@@ -10,6 +10,10 @@ import time
 import signal
 import sys
 import urllib
+import os
+import dotenv
+
+dotenv.load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -96,6 +100,7 @@ class SimpleQdrantToEndeeMigrator:
         qdrant_port: int,
         qdrant_api_key: str,
         qdrant_collection: str,
+        endee_url: str,
         endee_api_key: str,
         endee_index: str,
         fetch_batch_size: int = 1000,
@@ -107,6 +112,7 @@ class SimpleQdrantToEndeeMigrator:
         self.qdrant_port = qdrant_port
         self.qdrant_api_key = qdrant_api_key
         self.qdrant_collection = qdrant_collection
+        self.endee_url = endee_url
         self.endee_api_key = endee_api_key
         self.endee_index_name = endee_index
         self.fetch_batch_size = fetch_batch_size
@@ -147,7 +153,7 @@ class SimpleQdrantToEndeeMigrator:
         """Connect to Qdrant"""
         logger.info("Connecting to Qdrant...")
         self.qdrant_client = QdrantClient(
-            host=self.qdrant_url,
+            url=self.qdrant_url,
             port=self.qdrant_port,
             api_key=self.qdrant_api_key,
             https=bool(self.use_https)
@@ -409,32 +415,35 @@ def main():
     )
     
     # Source arguments
-    parser.add_argument("--source_url", required=True, help="Qdrant cluster endpoint")
-    parser.add_argument("--source_api_key", required=True, help="Qdrant API key")
-    parser.add_argument("--source_collection", required=True, help="Qdrant collection name")
-    parser.add_argument("--source_port", type=int, required=True, help="Qdrant port")
+    parser.add_argument("--source_url", default=os.getenv("SOURCE_URL"), help="Qdrant cluster endpoint")
+    parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY",""), help="Qdrant API key")
+    parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Qdrant collection name")
+    parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Qdrant port")
     
     # Target arguments
-    parser.add_argument("--target_api_key", required=True, help="Endee API key")
-    parser.add_argument("--target_collection", required=True, help="Endee index name")
+    parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URL")
+    parser.add_argument("--target_api_key", default=os.getenv("TARGET_API_KEY",""), help="Endee API key")
+    parser.add_argument("--target_collection", default=os.getenv("TARGET_COLLECTION"), help="Endee index name")
     
     # Performance arguments
-    parser.add_argument("--batch_size", type=int, default=1000, 
+    parser.add_argument("--batch_size", type=int, default=os.getenv("BATCH_SIZE",1000), 
                        help="Fetch batch size (default: 1000)")
-    parser.add_argument("--upsert_size", type=int, default=1000, 
+    parser.add_argument("--upsert_size", type=int, default=os.getenv("UPSERT_SIZE",1000), 
                        help="Upsert batch size (default: 1000)")
     
     # Resume arguments
-    parser.add_argument("--checkpoint_file", default="./migration_checkpoint.json", 
+    parser.add_argument("--checkpoint_file", default=os.getenv("CHECKPOINT_FILE","./migration_checkpoint.json"), 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
     parser.add_argument("--clear_checkpoint", action="store_true", 
+                       default=os.getenv("CLEAR_CHECKPOINT",False),
                        help="Clear existing checkpoint and start fresh")
     
     # Debug
     parser.add_argument("--debug", action="store_true", 
+                       default=os.getenv("DEBUG",False),
                        help="Enable debug logging")
     
-    parser.add_argument("--use_https", action="store_true", default=False,
+    parser.add_argument("--use_https", action="store_true", default=os.getenv("USE_HTTPS",False),
                        help="Use HTTPS for Qdrant connection")
     
     args = parser.parse_args()
@@ -450,6 +459,7 @@ def main():
         qdrant_port=args.source_port,
         qdrant_api_key=args.source_api_key,
         qdrant_collection=args.source_collection,
+        endee_url=args.target_url,
         endee_api_key=args.target_api_key,
         endee_index=args.target_collection,
         fetch_batch_size=args.batch_size,

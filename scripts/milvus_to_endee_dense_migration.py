@@ -10,6 +10,10 @@ import time
 import signal
 import sys
 import urllib
+import os
+import dotenv
+
+dotenv.load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -540,38 +544,40 @@ def main():
     )
     
     # Source arguments
-    parser.add_argument("--source_url", required=True, help="Milvus URI")
-    parser.add_argument("--source_api_key", required=True, help="Milvus token")
-    parser.add_argument("--source_collection", required=True, help="Milvus collection name")
-    parser.add_argument("--source_port", type=int, required=True, help="Milvus port")
+    parser.add_argument("--source_url", default=os.getenv("SOURCE_URL"), help="Milvus URI")
+    parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY"), help="Milvus token")
+    parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Milvus collection name")
+    parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
 
     # Target arguments
-    parser.add_argument("--target_url", required=True, help="Endee URI")
-    parser.add_argument("--target_api_key", required=True, help="Endee API key")
-    parser.add_argument("--target_collection", required=True, default=19530, help="Endee index name")
+    parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URI")
+    parser.add_argument("--target_api_key", default=os.getenv("TARGET_API_KEY"), help="Endee API key")
+    parser.add_argument("--target_collection", default=os.getenv("TARGET_COLLECTION"), help="Endee index name")
     
     # Performance arguments
-    parser.add_argument("--batch_size", type=int, default=1000, 
+    parser.add_argument("--batch_size", type=int, default=os.getenv("BATCH_SIZE",1000), 
                        help="Fetch batch size (default: 1000)")
-    parser.add_argument("--upsert_size", type=int, default=1000, 
+    parser.add_argument("--upsert_size", type=int, default=os.getenv("UPSERT_SIZE",1000), 
                        help="Upsert batch size (default: 1000)")
     
     # Collection configuration
-    parser.add_argument("--space_type", default="cosine",
+    parser.add_argument("--space_type", default=os.getenv("SPACE_TYPE","cosine"),
                        help="Distance metric (default: cosine)")
-    parser.add_argument("--M", type=int, default=16,
+    parser.add_argument("--M", type=int, default=os.getenv("M",16),
                        help="HNSW M parameter (default: 16)")
-    parser.add_argument("--ef_construct", type=int, default=128,
+    parser.add_argument("--ef_construct", type=int, default=os.getenv("EF_CONSTRUCT",128),
                        help="HNSW ef_construct parameter (default: 128)")
     
     # Resume arguments
-    parser.add_argument("--checkpoint_file", default="./migration_checkpoint.json", 
+    parser.add_argument("--checkpoint_file", default=os.getenv("CHECKPOINT_FILE","./migration_checkpoint.json"), 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
     parser.add_argument("--clear_checkpoint", action="store_true", 
+                       default=os.getenv("CLEAR_CHECKPOINT",False),
                        help="Clear existing checkpoint and start fresh")
     
     # Debug
     parser.add_argument("--debug", action="store_true", 
+                       default=os.getenv("DEBUG",False),
                        help="Enable debug logging")
     
     args = parser.parse_args()
