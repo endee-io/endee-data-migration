@@ -56,8 +56,9 @@ class MigrationCheckpoint:
     def save(self):
         """Save checkpoint to file"""
         try:
-            with open(self.checkpoint_file, 'w') as f:
-                orjson.dump(self.data, f, indent=2)
+            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+            with open(self.checkpoint_file, 'wb') as f:
+                f.write(orjson.dumps(self.data, option=orjson.OPT_INDENT_2))
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
     
@@ -167,7 +168,7 @@ class SimpleQdrantToEndeeMigrator:
         # Initialize Endee client with API key
         self.endee_client = Endee(token=self.endee_api_key)
 
-        
+        logger.info(f"Endee base URL: {self.endee_url}")
         # # Set custom base URL if provided
         if self.endee_url:
             url = urllib.parse.urljoin(self.endee_url, "/api/v1")
