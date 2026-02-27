@@ -12,6 +12,7 @@ import signal
 import sys
 import os
 import dotenv
+import numpy as np
 
 dotenv.load_dotenv()
 
@@ -22,6 +23,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+MILVUS_DTYPE_TO_ENDEE_PRECISION = {
+    DataType.FLOAT_VECTOR:    Precision.FLOAT32,   # 32-bit float
+    DataType.FLOAT16_VECTOR:  Precision.FLOAT16,   # 16-bit half precision
+    # DataType.BFLOAT16_VECTOR: Precision.FLOAT16,   # bfloat16 → closest Endee match
+    DataType.BINARY_VECTOR:   Precision.BINARY2,    # binary
+}
+# Also handle string versions just in case
+MILVUS_STR_TO_ENDEE_PRECISION = {
+    'FLOAT_VECTOR':    Precision.FLOAT32,
+    'FLOAT16_VECTOR':  Precision.FLOAT16,
+    'BFLOAT16_VECTOR': Precision.FLOAT16,
+    'BINARY_VECTOR':   Precision.BINARY2,
+}
 
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
@@ -100,12 +114,12 @@ class HybridMilvusToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
+        M: int,
+        ef_construct: int,
         milvus_port: int = 19530,
         fetch_batch_size: int = 1000,
         upsert_batch_size: int = 1000,
         space_type: str = "cosine",
-        M: int = 16,
-        ef_construct: int = 128,
         checkpoint_file: str = "./migration_checkpoint.json"
     ):
         self.milvus_url = milvus_url
@@ -138,7 +152,9 @@ class HybridMilvusToEndeeMigrator:
         self.milvus_client = None
         self.endee_client = None
         self.endee_index = None
-        
+
+        self.dense_vector_field_type=None
+
         # Statistics
         self.stats = {
             "fetched": 0,
@@ -238,6 +254,45 @@ class HybridMilvusToEndeeMigrator:
             logger.warning(f"Using default sparse dimension: 30000")
             return 30000
     
+    def decode_vector(self, raw_vector, field_type):
+        """Decode Milvus vector bytes to float list for Endee"""
+        
+        logger.debug(f"decode_vector called: type={field_type}, raw type={type(raw_vector)}, value preview={str(raw_vector)[:80]}")
+        
+        # Unwrap list wrapper if present e.g. [b'\x99...'] → b'\x99...'
+        if isinstance(raw_vector, list):
+            if len(raw_vector) == 1 and isinstance(raw_vector[0], bytes):
+                raw_bytes = raw_vector[0]
+            elif len(raw_vector) > 0 and isinstance(raw_vector[0], (int, float)):
+                return raw_vector  # already float list, no conversion needed
+            else:
+                raw_bytes = raw_vector[0] if raw_vector else b''
+        elif isinstance(raw_vector, bytes):
+            raw_bytes = raw_vector
+        else:
+            return raw_vector  # already usable
+        
+        # Now decode bytes based on field type
+        if field_type == DataType.FLOAT16_VECTOR:
+            arr = np.frombuffer(raw_bytes, dtype=np.float16)
+            return arr.astype(np.float32).tolist()
+        
+        elif field_type == DataType.BFLOAT16_VECTOR:
+            raise ValueError(
+                "BFLOAT16_VECTOR is not supported. "
+                "Convert to FLOAT32 or FLOAT16 before migrating."
+            )
+        
+        elif field_type == DataType.FLOAT_VECTOR:
+            # FLOAT_VECTOR shouldn't be bytes but handle just in case
+            arr = np.frombuffer(raw_bytes, dtype=np.float32)
+            return arr.tolist()
+        
+        # Fallback - try float16 decode
+        logger.warning(f"Unknown field type {field_type}, attempting float16 decode")
+        arr = np.frombuffer(raw_bytes, dtype=np.float16)
+        return arr.astype(np.float32).tolist()
+
     def detect_vector_fields(self):
         """
         Auto-detect vector field names, ID field name, and dimensions
@@ -273,22 +328,44 @@ class HybridMilvusToEndeeMigrator:
                 self.id_field_name = field_name
                 logger.info(f"✓ ID Field (Primary Key): '{field_name}' [{field_type}]")
             
+            elif field_type in [DataType.BFLOAT16_VECTOR,'BFLOAT16_VECTOR']:
+                raise ValueError(
+                    f"Unsupported vector type: BFLOAT16_VECTOR in field '{field_name}'. "
+                    f"Endee does not support BFLOAT16 precision. "
+                    f"Please convert your vectors to FLOAT32 or FLOAT16 before migrating."
+                )
+            
             # Detect dense vector fields
-            elif field_type in ['FLOAT_VECTOR', 'BINARY_VECTOR', DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR]:
+            elif field_type in ['FLOAT_VECTOR', 'FLOAT16_VECTOR', 'BINARY_VECTOR',
+                    DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, 
+                     DataType.BINARY_VECTOR]:
+                index_info = self.milvus_client.describe_index(self.milvus_collection, field_name)
                 params = field.get('params', {})
                 dim = params.get('dim') or field.get('dim')
+
+                
+                # Detect precision from field type
+                precision = (
+                    MILVUS_DTYPE_TO_ENDEE_PRECISION.get(field_type) or
+                    MILVUS_STR_TO_ENDEE_PRECISION.get(field_type) or
+                    Precision.FLOAT32  # fallback
+                )
                 
                 dense_vector_fields.append({
                     'name': field_name,
                     'type': field_type,
-                    'dimension': dim
+                    'dimension': dim,
+                    'precision': precision   # ← store per vector field
                 })
                 
+                self.ef_construct = index_info.get('params', {}).get('efConstruction', self.ef_construct)
+                self.M = index_info.get('params', {}).get('M', self.M)
+
                 # Use the first dense vector field found
                 if self.dense_vector_field_name is None:
                     self.dense_vector_field_name = field_name
                     self.vectors_dimension = dim
-                
+                    self.precision = precision  # ← set on self
                 logger.info(f"✓ Dense Vector Field: '{field_name}' [{field_type}, dim={dim}]")
             
             # Detect sparse vector fields
@@ -430,9 +507,10 @@ class HybridMilvusToEndeeMigrator:
             try:
                 # Extract ID using detected field name
                 record_id = str(record.get(self.id_field_name, ''))
-                
+                raw_dense_vector = record.get(self.dense_vector_field_name, [])
+
                 # Extract dense vector using detected field name
-                dense_vector = record.get(self.dense_vector_field_name, [])
+                dense_vector = self.decode_vector(raw_dense_vector, self.dense_vector_field_type)
                 sparse_vector = record.get(self.sparse_vector_field_name,{})
           
                 # Build Endee record
@@ -688,7 +766,7 @@ def main():
     # Source arguments
     parser.add_argument("--source_url", default=os.getenv("SOURCE_URL"), help="Milvus URI")
     parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY"), help="Milvus token")
-    parser.add_argument("--source_collection", required=True, help="Milvus collection name")
+    parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Milvus collection name")
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
 
     

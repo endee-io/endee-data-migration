@@ -153,13 +153,16 @@ class SimpleQdrantToEndeeMigrator:
     def connect_qdrant(self):
         """Connect to Qdrant"""
         logger.info("Connecting to Qdrant...")
-        self.qdrant_client = QdrantClient(
-            url=self.qdrant_url,
-            port=self.qdrant_port,
-            api_key=self.qdrant_api_key,
-            https=bool(self.use_https)
-        )
-        logger.info("✓ Connected to Qdrant")
+        try:
+            self.qdrant_client = QdrantClient(
+                url=self.qdrant_url,
+                port=self.qdrant_port,
+                api_key=self.qdrant_api_key,
+                https=bool(self.use_https)
+            )
+            logger.info("✓ Connected to Qdrant")
+        except Exception as e:
+            logger.error(f"Failed to connect to Qdrant: {e}")
     
     def connect_endee(self):
         """Connect to Endee"""
@@ -181,6 +184,9 @@ class SimpleQdrantToEndeeMigrator:
     def get_qdrant_collection_info(self) -> Dict[str, Any]:
         """Get collection configuration from Qdrant"""
         logger.info(f"Getting collection info for: {self.qdrant_collection}")
+        # LIST ALL COLLECTIONS
+        collections = self.qdrant_client.get_collections()
+        print("collections: ",collections)
         collection_info = self.qdrant_client.get_collection(self.qdrant_collection)
         
         vectors = collection_info.config.params.vectors
@@ -192,8 +198,16 @@ class SimpleQdrantToEndeeMigrator:
         else:
             vectors_map = {}
         
-        vectors_dimension = 768
-        space_type = "cosine"
+        vectors_dimension = collection_info.config.params.vectors.size
+        qdrant_space_type = collection_info.config.params.vectors.distance
+        if qdrant_space_type == "Cosine":
+            endee_space_type = "cosine"
+        elif qdrant_space_type == "Euclid":
+            endee_space_type = "l2"
+        elif qdrant_space_type == "Dot":
+            endee_space_type = "ip"
+        else:
+            raise ValueError(f"Invalid space type: {qdrant_space_type}")
         
         for _, config in vectors_map.items():
             vectors_dimension = config.size
@@ -202,17 +216,45 @@ class SimpleQdrantToEndeeMigrator:
         
         M = collection_info.config.hnsw_config.m
         ef_construct = collection_info.config.hnsw_config.ef_construct
+        quantization_config = dict(collection_info.config.quantization_config)
+        print("quantization_config: ",quantization_config)
+        if quantization_config:
+            key = quantization_config.keys()
+            print("key: ",key)
+            if "scalar" in key:
+                # QDRANT SUPPORT ONLY INT8 IN SCALAR
+                endee_precision = Precision.INT8
+            elif "product" in key:
+                raise ValueError(f"Product quantization is not supported: {quantization_config}")
+                
+            elif "binary" in key:
+                print("hurrey")
+                # DON'T SUPPORT ASYMMETRIC QUANTIZATION
+                binary_config = quantization_config.get("binary", {})
+                if "query_encoding" in binary_config:
+                    raise ValueError(
+                        f"Asymmetric quantization is not supported: {quantization_config}"
+                    )
+                encoding = quantization_config.get("encoding",None)
+                if not encoding:
+                    endee_precision = Precision.BINARY2
+                else:
+                    raise ValueError(f"Invalid binary quantization encoding: {encoding}")
+            else:
+                endee_precision = Precision.FLOAT32
+        else:
+            endee_precision = Precision.FLOAT32
         
         config = {
             "dimension": vectors_dimension,
-            "space_type": space_type,
+            "space_type": endee_space_type,
             "M": M,
             "ef_construct": ef_construct,
-            "precision": Precision.FLOAT16
+            "precision": endee_precision
         }
         
         logger.info(f"✓ Collection config: dim={config['dimension']}, "
-                   f"space={config['space_type']}, M={config['M']}, ef={config['ef_construct']}")
+                   f"space={config['space_type']}, M={config['M']}, ef_construct={ef_construct}, precision={endee_precision}")
         return config
     
     def get_or_create_endee_index(self, config: Dict[str, Any]):
@@ -303,78 +345,79 @@ class SimpleQdrantToEndeeMigrator:
         
         # Get collection config and create/verify index
         config = self.get_qdrant_collection_info()
-        self.get_or_create_endee_index(config)
+        print("config: ",config)
+        # self.get_or_create_endee_index(config)
         
-        # Verify index is ready
-        if self.endee_index is None:
-            raise RuntimeError("Endee index not initialized!")
-        logger.info(f"Endee index ready")
+        # # Verify index is ready
+        # if self.endee_index is None:
+        #     raise RuntimeError("Endee index not initialized!")
+        # logger.info(f"Endee index ready")
         
-        # Start migration
-        offset = self.checkpoint.get_last_offset()
-        batch_number = self.checkpoint.get_batch_number()
+        # # Start migration
+        # offset = self.checkpoint.get_last_offset()
+        # batch_number = self.checkpoint.get_batch_number()
         
-        logger.info("\nStarting migration loop...")
-        logger.info("="*80)
+        # logger.info("\nStarting migration loop...")
+        # logger.info("="*80)
         
-        with tqdm(desc="Migrating records", unit="records", 
-                 initial=self.checkpoint.get_processed_count()) as pbar:
+        # with tqdm(desc="Migrating records", unit="records", 
+        #          initial=self.checkpoint.get_processed_count()) as pbar:
             
-            while not self.interrupted:
-                try:
-                    # Fetch batch from Qdrant
-                    logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
-                    points_batch, next_offset = self.fetch_batch(offset)
+        #     while not self.interrupted:
+        #         try:
+        #             # Fetch batch from Qdrant
+        #             logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
+        #             points_batch, next_offset = self.fetch_batch(offset)
                     
-                    # Check if done
-                    if not points_batch:
-                        logger.info("✓ No more data to fetch")
-                        break
+        #             # Check if done
+        #             if not points_batch:
+        #                 logger.info("✓ No more data to fetch")
+        #                 break
                     
-                    # Convert to Endee format
-                    records = self.convert_records(points_batch)
-                    records_count = len(records)
-                    self.stats["fetched"] += records_count
+        #             # Convert to Endee format
+        #             records = self.convert_records(points_batch)
+        #             records_count = len(records)
+        #             self.stats["fetched"] += records_count
                     
-                    logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+        #             logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
                     
-                    # Upsert to Endee
-                    logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-                    success = self.upsert_records(records)
+        #             # Upsert to Endee
+        #             logger.info(f"[Batch {batch_number}] Upserting to Endee...")
+        #             success = self.upsert_records(records)
                     
-                    if success:
-                        # Update checkpoint
-                        self.checkpoint.update(batch_number, records_count, next_offset)
-                        self.stats["upserted"] += records_count
-                        self.stats["batches_processed"] += 1
+        #             if success:
+        #                 # Update checkpoint
+        #                 self.checkpoint.update(batch_number, records_count, next_offset)
+        #                 self.stats["upserted"] += records_count
+        #                 self.stats["batches_processed"] += 1
                         
-                        # Update progress bar
-                        pbar.update(records_count)
+        #                 # Update progress bar
+        #                 pbar.update(records_count)
                         
-                        logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
-                    else:
-                        self.stats["failed"] += records_count
-                        logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
-                        break
+        #                 logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
+        #             else:
+        #                 self.stats["failed"] += records_count
+        #                 logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
+        #                 break
                     
-                    # Check if done
-                    if next_offset is None:
-                        logger.info("✓ Reached end of collection")
-                        break
+        #             # Check if done
+        #             if next_offset is None:
+        #                 logger.info("✓ Reached end of collection")
+        #                 break
                     
-                    # Move to next batch
-                    offset = next_offset
-                    batch_number += 1
+        #             # Move to next batch
+        #             offset = next_offset
+        #             batch_number += 1
                     
-                except Exception as e:
-                    logger.error(f"[Batch {batch_number}] Exception: {e}")
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    self.stats["failed"] += records_count if 'records_count' in locals() else 0
-                    break
+        #         except Exception as e:
+        #             logger.error(f"[Batch {batch_number}] Exception: {e}")
+        #             import traceback
+        #             logger.error(f"Traceback: {traceback.format_exc()}")
+        #             self.stats["failed"] += records_count if 'records_count' in locals() else 0
+        #             break
         
-        # Print final report
-        self._print_final_report()
+        # # Print final report
+        # self._print_final_report()
     
     def _print_final_report(self):
         """Print migration summary"""

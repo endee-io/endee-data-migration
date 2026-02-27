@@ -46,7 +46,7 @@ docker build -t vector-migration:latest .
 docker run \
   --rm \
   --network vector-net \
-  --env-file .env \
+  --env-file .env.dev \
   -v $(pwd)/data:/app/data \
   vector-migration:latest \
-  qdrant-to-endee-dense
+  milvus-to-endee-hybrid
