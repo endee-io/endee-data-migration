@@ -107,7 +107,9 @@ class QdrantHybridToEndeeMigrator:
         fetch_batch_size: int = 1000,
         upsert_batch_size: int = 1000,
         use_https: bool = False,
-        checkpoint_file: str = "./migration_checkpoint.json"
+        checkpoint_file: str = "./migration_checkpoint.json",
+        filter_fields: str = ""
+
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
@@ -119,7 +121,7 @@ class QdrantHybridToEndeeMigrator:
         self.fetch_batch_size = fetch_batch_size
         self.upsert_batch_size = upsert_batch_size
         self.use_https = False
-        
+        self.filter_fields = set(f.strip() for f in filter_fields.split(",") if f.strip()) if filter_fields else set()
         self.checkpoint = MigrationCheckpoint(checkpoint_file)
         self.interrupted = False
         self.max_queue_size = max_queue_size
@@ -309,18 +311,21 @@ class QdrantHybridToEndeeMigrator:
         logger.info(f"Getting collection info for: {self.qdrant_collection}")
         collection_info = self.qdrant_client.get_collection(self.qdrant_collection)
         
-        vectors = collection_info.config.params.vectors
-
+        params =  collection_info.config.params
+        vectors = params.vectors
+        # =========================================================================================
         if isinstance(vectors, dict):
             vectors_map = vectors
         elif vectors is not None:
             vectors_map = {"default": vectors}
         else:
             vectors_map = {}
-        
-        # Default values
-        vectors_dimension = collection_info.config.params.vectors.size
-        qdrant_space_type = collection_info.config.params.vectors.distance
+
+        # =========================================================================================
+        # SET DIMENSION, AND SPACE TYPE
+        logger.info(f"collection_info.config.params.vectors: {collection_info.config.params}")
+        vectors_dimension = vectors['dense'].size
+        qdrant_space_type = vectors['dense'].distance
         if qdrant_space_type == "Cosine":
             endee_space_type = "cosine"
         elif qdrant_space_type == "Euclid":
@@ -330,19 +335,54 @@ class QdrantHybridToEndeeMigrator:
         else:
             raise ValueError(f"Invalid space type: {qdrant_space_type}")
         sparse_dimension = 30522  # Default sparse dimension
+        # =========================================================================================
+
+        # AUTO DETECT DENSE FIELD 
+        self.dense_field_name = None
+
+        if isinstance(vectors, dict):
+            # Named vectors → find the dense one (has .size attribute)
+            for name, config in vectors.items():
+                if hasattr(config, 'size') and config.size is not None:
+                    self.dense_field_name = name
+
+                    logger.info(f"✓ Detected dense field: '{name}'")
+                    break  # use first dense field found
+        elif vectors is not None:
+            # Single unnamed dense vector
+            self.dense_field_name = "default"
+            logger.info(f"✓ Single dense vector")
         
-        # Get dense vector config
-        for _, config in vectors_map.items():
-            vectors_dimension = config.size
-            space_type = config.distance
-            break
+        if self.dense_field_name is None:
+            raise ValueError("No dense vector field found in collection")
+        # =========================================================================================
+        
+
+        # ─── AUTO DETECT SPARSE FIELD ──────────────────────────────────────────
+        # Sparse vectors are in params.sparse_vectors, NOT in params.vectors
+        sparse_vectors = params.sparse_vectors  # e.g. {'sparse': SparseVectorParams(...)}
+        self.sparse_field_name = None
+
+        if sparse_vectors and isinstance(sparse_vectors, dict):
+            for name, config in sparse_vectors.items():
+                self.sparse_field_name = name  # use first sparse field found
+                logger.info(f"✓ Detected sparse field: '{name}'")
+                break
+        
+        if self.sparse_field_name:
+            logger.info(f"Collection type: HYBRID (dense='{self.dense_field_name}', sparse='{self.sparse_field_name}')")
+        else:
+            logger.info(f"Collection type: DENSE ONLY (dense='{self.dense_field_name}')")
+        # =========================================================================================
+        
         
         # Get HNSW config
         M = collection_info.config.hnsw_config.m
         ef_construct = collection_info.config.hnsw_config.ef_construct
-        quantization_config = dict(collection_info.config.quantization_config)
 
-        if quantization_config:
+        if collection_info.config.quantization_config:
+            quantization_config = dict(collection_info.config.quantization_config)
+            
             key = quantization_config.keys()
             if "scalar" in key:
                 # QDRANT SUPPORT ONLY INT8 IN SCALAR
@@ -366,6 +406,7 @@ class QdrantHybridToEndeeMigrator:
                 endee_precision = Precision.FLOAT32
         else:
             endee_precision = Precision.FLOAT32
+        
         
         config = {
             "dimension": vectors_dimension,
@@ -423,24 +464,42 @@ class QdrantHybridToEndeeMigrator:
         Endee format: {id, vector, sparse_indices, sparse_values, meta}
         """
         records = []
+        # CHECK IF FILTER FIELDS ARE PRESENT IN THE PAYLOAD
+        if points:
+            payload = points[0].payload
+            for field in self.filter_fields:
+                if field not in payload.keys():
+                    raise ValueError(f"Field {field} not found in payload")
         for point in points:
             try:
                 # Extract dense and sparse vectors
                 vector_data = point.vector
                 
-                # Handle both dict and direct access patterns
+                # =============== HANDLE BOTH DENSE AND SPARSE VECTORS =========================
                 if isinstance(vector_data, dict):
-                    dense_vector = vector_data.get('dense')
-                    sparse_data = vector_data.get('sparse_keywords')
+                    dense_vector = vector_data.get(self.dense_field_name)
+                    sparse_data = vector_data.get(self.sparse_field_name)
                 else:
                     # If vector is not a dict, assume it's dense only
                     dense_vector = vector_data
                     sparse_data = None
+                payload = point.payload or {}
+
+                # =============== HANDLE FILTERS AND META DATA =========================
+                
+
+                if self.filter_fields:
+                    filter_data = {key: value for key, value in payload.items() if key in self.filter_fields}
+                    meta_data = {key: value for key, value in payload.items() if key not in self.filter_fields}
+                else:
+                    filter_data = payload
+                    meta_data = {}
                 
                 record = {
                     "id": str(point.id),
                     "vector": dense_vector,
-                    "meta": point.payload
+                    "meta": meta_data,
+                    "filter": filter_data
                 }
                 
                 # Add sparse vector if present
@@ -548,98 +607,98 @@ class QdrantHybridToEndeeMigrator:
         # Get collection config and create/verify index
         config = self.get_qdrant_collection_info()
         print("config: ",config)
-        # self.get_or_create_endee_index(config)
+        self.get_or_create_endee_index(config)
         
-        # # Verify index is ready
-        # if self.endee_index is None:
-        #     raise RuntimeError("Endee index not initialized!")
-        # logger.info(f"✓ Endee hybrid index ready")
+        # Verify index is ready
+        if self.endee_index is None:
+            raise RuntimeError("Endee index not initialized!")
+        logger.info(f"✓ Endee hybrid index ready")
         
-        # # Start migration
-        # offset = self.checkpoint.get_last_offset()
-        # batch_number = self.checkpoint.get_batch_number()
+        # Start migration
+        offset = self.checkpoint.get_last_offset()
+        batch_number = self.checkpoint.get_batch_number()
         
-        # logger.info("\nStarting migration loop...")
-        # logger.info("="*80)
+        logger.info("\nStarting migration loop...")
+        logger.info("="*80)
 
-        # # CREATE BOUNDED QUEUE WITH MAX SIZE OF 5 
-        # queue = asyncio.Queue(maxsize=self.max_queue_size)
-        # logger.info(f"BOUNDED QUEUE CREATED WITH MAX SIZE OF {self.max_queue_size}")
+        # CREATE BOUNDED QUEUE WITH MAX SIZE OF 5 
+        queue = asyncio.Queue(maxsize=self.max_queue_size)
+        logger.info(f"BOUNDED QUEUE CREATED WITH MAX SIZE OF {self.max_queue_size}")
 
         
-        # # with tqdm(desc="Migrating records", unit="records", 
-        # #          initial=self.checkpoint.get_processed_count()) as pbar:
+        # with tqdm(desc="Migrating records", unit="records", 
+        #          initial=self.checkpoint.get_processed_count()) as pbar:
             
-        # #     while not self.interrupted:
-        # #         try:
-        # #             # Fetch batch from Qdrant
-        # #             logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
-        # #             points_batch, next_offset = self.fetch_batch(offset)
+        #     while not self.interrupted:
+        #         try:
+        #             # Fetch batch from Qdrant
+        #             logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
+        #             points_batch, next_offset = self.fetch_batch(offset)
                     
-        # #             # Check if done
-        # #             if not points_batch:
-        # #                 logger.info("✓ No more data to fetch")
-        # #                 break
+        #             # Check if done
+        #             if not points_batch:
+        #                 logger.info("✓ No more data to fetch")
+        #                 break
                     
-        # #             # Convert to Endee format
-        # #             records = self.convert_records(points_batch)
-        # #             records_count = len(records)
-        # #             self.stats["fetched"] += records_count
+        #             # Convert to Endee format
+        #             records = self.convert_records(points_batch)
+        #             records_count = len(records)
+        #             self.stats["fetched"] += records_count
                     
-        # #             logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+        #             logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
                     
-        # #             # Upsert to Endee
-        # #             logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-        # #             success = self.upsert_records(records)
+        #             # Upsert to Endee
+        #             logger.info(f"[Batch {batch_number}] Upserting to Endee...")
+        #             success = self.upsert_records(records)
                     
-        # #             if success:
-        # #                 # Update checkpoint
-        # #                 self.checkpoint.update(batch_number, records_count, next_offset)
-        # #                 self.stats["upserted"] += records_count
-        # #                 self.stats["batches_processed"] += 1
+        #             if success:
+        #                 # Update checkpoint
+        #                 self.checkpoint.update(batch_number, records_count, next_offset)
+        #                 self.stats["upserted"] += records_count
+        #                 self.stats["batches_processed"] += 1
                         
-        # #                 # Update progress bar
-        # #                 pbar.update(records_count)
+        #                 # Update progress bar
+        #                 pbar.update(records_count)
                         
-        # #                 logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
-        # #             else:
-        # #                 self.stats["failed"] += records_count
-        # #                 logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
-        # #                 break
+        #                 logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
+        #             else:
+        #                 self.stats["failed"] += records_count
+        #                 logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
+        #                 break
                     
-        # #             # Check if done
-        # #             if next_offset is None:
-        # #                 logger.info("✓ Reached end of collection")
-        # #                 break
+        #             # Check if done
+        #             if next_offset is None:
+        #                 logger.info("✓ Reached end of collection")
+        #                 break
                     
-        # #             # Move to next batch
-        # #             offset = next_offset
-        # #             batch_number += 1
+        #             # Move to next batch
+        #             offset = next_offset
+        #             batch_number += 1
                     
-        # #         except Exception as e:
-        # #             logger.error(f"[Batch {batch_number}] Exception: {e}")
-        # #             import traceback
-        # #             logger.error(f"Traceback: {traceback.format_exc()}")
-        # #             self.stats["failed"] += records_count if 'records_count' in locals() else 0
-        # #             break
+        #         except Exception as e:
+        #             logger.error(f"[Batch {batch_number}] Exception: {e}")
+        #             import traceback
+        #             logger.error(f"Traceback: {traceback.format_exc()}")
+        #             self.stats["failed"] += records_count if 'records_count' in locals() else 0
+        #             break
         
-        # # # Print final report
-        # # self._print_final_report()
-
-        # pbar = tqdm(
-        #     desc="Migrating records",
-        #     unit="records",
-        #     initial = self.checkpoint.get_processed_count(),
-        # )
-        # # RUN PRODUCER AND CONSUMER
-        # await asyncio.gather(
-        #     self.async_producer(queue),
-        #     self.async_consumer(queue, pbar),
-        # )
-        # pbar.close()
-        # logger.info("ASYNC MIGRATION COMPLETED")
-        # logger.info("="*80)
+        # # Print final report
         # self._print_final_report()
+
+        pbar = tqdm(
+            desc="Migrating records",
+            unit="records",
+            initial = self.checkpoint.get_processed_count(),
+        )
+        # RUN PRODUCER AND CONSUMER
+        await asyncio.gather(
+            self.async_producer(queue),
+            self.async_consumer(queue, pbar),
+        )
+        pbar.close()
+        logger.info("ASYNC MIGRATION COMPLETED")
+        logger.info("="*80)
+        self._print_final_report()
 
     def _print_final_report(self):
         """Print migration summary"""
@@ -688,7 +747,8 @@ def main():
     parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY",""), help="Qdrant API key")
     parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Qdrant collection name")
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Qdrant port")
-    
+    parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Comma-separated payload fields to use as Endee filter (e.g. category,price,year). "
+         "All other fields go to meta. If not set, everything goes to meta.")
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URL")
     parser.add_argument("--target_api_key", default=os.getenv("TARGET_API_KEY",""), help="Endee API key")
@@ -741,7 +801,8 @@ def main():
         fetch_batch_size=args.batch_size,
         upsert_batch_size=args.upsert_size,
         use_https=args.use_https,
-        checkpoint_file=args.checkpoint_file
+        checkpoint_file=args.checkpoint_file,
+        filter_fields=args.filter_fields
     )
     
     # Clear checkpoint if requested

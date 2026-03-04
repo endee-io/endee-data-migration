@@ -121,7 +121,8 @@ class SimpleMilvusToEndeeMigrator:
         space_type: str = "cosine",
         M: int = 16,
         ef_construct: int = 128,
-        checkpoint_file: str = "./migration_checkpoint.json"
+        checkpoint_file: str = "./migration_checkpoint.json",
+        filter_fields: str = ""
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
@@ -132,7 +133,7 @@ class SimpleMilvusToEndeeMigrator:
         self.endee_index_name = endee_index
         self.fetch_batch_size = fetch_batch_size
         self.upsert_batch_size = upsert_batch_size
-        
+        self.filter_fields = set(f.strip() for f in filter_fields.split(",") if f.strip()) if filter_fields else set()
         # Collection config
         self.space_type = space_type
         self.M = M
@@ -258,7 +259,7 @@ class SimpleMilvusToEndeeMigrator:
         
         # Get collection schema
         desc = self.milvus_client.describe_collection(self.milvus_collection)
-        print("desc: ",desc)
+
         # Storage for detected fields
         vector_fields = []
         id_field = None
@@ -345,11 +346,12 @@ class SimpleMilvusToEndeeMigrator:
         logger.info(f"\n{'='*80}\n")
         
         self.vector_field_info = {
-            'id_field': id_field,
-            'vector_fields': vector_fields,
-            'other_fields': other_fields
+            'id_field_meta': id_field,
+            'vector_field_meta': vector_fields,
+            'other_fields_meta': other_fields
         }
-        
+
+        print("vector_field_info: ", self.vector_field_info)
         if not self.id_field_name:
             raise ValueError("No primary key field found in collection")
         if not self.vector_field_name:
@@ -400,27 +402,34 @@ class SimpleMilvusToEndeeMigrator:
     
     def convert_records(self, milvus_records) -> list:
         records = []
+
+        # CHECK IF FILTER FIELDS ARE PRESENT IN THE PAYLOAD
+        if self.vector_field_info:
+            payload_field_names = set(i.get('name') for i in self.vector_field_info.get('other_fields_meta',{}))
+            for field in self.filter_fields:
+                if field not in payload_field_names:
+                    raise ValueError(f"Field {field} not found in payload")
         for record in milvus_records:
             try:
-                record_id = str(record.get(self.id_field_name, ''))
-                raw_vector = record.get(self.vector_field_name, [])
-                
+
+                record_id = str(record.get(self.vector_field_info.get('id_field_meta').get('name')))
+                raw_vector = record.get(self.vector_field_info.get('vector_field_meta')[0].get('name'))
                 # ← this must be called
-                logger.debug(f"vector_field_type={self.vector_field_type}, raw_vector type={type(raw_vector)}")
+                # logger.debug(f"vector_field_type={self.vector_field_type}, raw_vector type={type(raw_vector)}")
                 vector = self.decode_vector(raw_vector, self.vector_field_type)
 
+                if self.filter_fields:
+                    filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
+                    meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
+                else:
+                    filter_data = {key:value for key, value in record.items() if key in payload_field_names}
+                    meta_data = {}
                 endee_record = {
                     "id": record_id,
                     "vector": vector,
-                    "meta": {}
+                    "filter": filter_data,
+                    "meta": meta_data
                 }
-
-                for k, v in record.items():
-                    if k not in [self.id_field_name, self.vector_field_name]:
-                        if isinstance(v, (dict, list)):
-                            endee_record["meta"][k] = json.dumps(v)
-                        else:
-                            endee_record["meta"][k] = v
 
                 records.append(endee_record)
 
@@ -517,18 +526,17 @@ class SimpleMilvusToEndeeMigrator:
                     
                     logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
                     
-                    # # Show sample record structure (first batch only)
-                    # if batch_number == 0 and records:
-                    #     logger.info(f"\nSample Endee record structure:")
-                    #     sample = records[0].copy()
-                    #     # Truncate vector for display
-                    #     if 'vector' in sample and len(sample['vector']) > 5:
-                    #         sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
-                    #     logger.info(json.dumps(sample, indent=2))
+                    # Show sample record structure (first batch only)
+                    if batch_number == 0 and records:
+                        logger.info(f"\nSample Endee record structure:")
+                        sample = records[0].copy()
+                        # Truncate vector for display
+                        if 'vector' in sample and len(sample['vector']) > 5:
+                            sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
+                        logger.info(json.dumps(sample, indent=2))
                     
                     # Upsert to Endee
                     logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-                    print("records: ",records)
                     success = self.upsert_records(records)
                     
                     if success:
@@ -621,6 +629,7 @@ def main():
     parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY"), help="Milvus token")
     parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Milvus collection name")
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
+    parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Filter fields")
 
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URI")
@@ -673,7 +682,8 @@ def main():
         space_type=args.space_type,
         M=args.M,
         ef_construct=args.ef_construct,
-        checkpoint_file=args.checkpoint_file
+        checkpoint_file=args.checkpoint_file,
+        filter_fields=args.filter_fields
     )
     
     # Clear checkpoint if requested

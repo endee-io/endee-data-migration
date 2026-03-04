@@ -107,12 +107,14 @@ class SimpleQdrantToEndeeMigrator:
         fetch_batch_size: int = 1000,
         upsert_batch_size: int = 1000,
         checkpoint_file: str = "./migration_checkpoint.json",
-        use_https: bool = False
+        use_https: bool = False,
+        filter_fields: str = ""
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
         self.qdrant_api_key = qdrant_api_key
         self.qdrant_collection = qdrant_collection
+        self.filter_fields = set(f.strip() for f in filter_fields.split(",") if f.strip()) if filter_fields else set()
         self.endee_url = endee_url
         self.endee_api_key = endee_api_key
         self.endee_index_name = endee_index
@@ -211,14 +213,13 @@ class SimpleQdrantToEndeeMigrator:
         
         for _, config in vectors_map.items():
             vectors_dimension = config.size
-            space_type = config.distance
             break
         
         M = collection_info.config.hnsw_config.m
         ef_construct = collection_info.config.hnsw_config.ef_construct
-        quantization_config = dict(collection_info.config.quantization_config)
-        print("quantization_config: ",quantization_config)
-        if quantization_config:
+
+        if collection_info.config.quantization_config:
+            quantization_config = dict(collection_info.config.quantization_config)
             key = quantization_config.keys()
             print("key: ",key)
             if "scalar" in key:
@@ -288,11 +289,27 @@ class SimpleQdrantToEndeeMigrator:
     
     def convert_records(self, points) -> list:
         """Convert Qdrant points to Endee format"""
+        # CHECK IF FILTER FIELDS ARE PRESENT IN THE PAYLOAD
+        if points:
+            payload = points[0].payload
+            for field in self.filter_fields:
+                if field not in payload.keys():
+                    raise ValueError(f"Field {field} not found in payload")
+
+        for point in points:
+            payload = point.payload or {}
+            if self.filter_fields:
+                filter_data = {key: value for key, value in payload.items() if key in self.filter_fields}
+                meta_data = {key: value for key, value in payload.items() if key not in self.filter_fields}
+            else:
+                filter_data = payload
+                meta_data = {}
         return [
             {
                 "id": str(point.id),
                 "vector": point.vector,
-                "meta": point.payload
+                "meta": meta_data,
+                "filter": filter_data
             }
             for point in points
         ]
@@ -346,78 +363,78 @@ class SimpleQdrantToEndeeMigrator:
         # Get collection config and create/verify index
         config = self.get_qdrant_collection_info()
         print("config: ",config)
-        # self.get_or_create_endee_index(config)
+        self.get_or_create_endee_index(config)
         
-        # # Verify index is ready
-        # if self.endee_index is None:
-        #     raise RuntimeError("Endee index not initialized!")
-        # logger.info(f"Endee index ready")
+        # Verify index is ready
+        if self.endee_index is None:
+            raise RuntimeError("Endee index not initialized!")
+        logger.info(f"Endee index ready")
         
-        # # Start migration
-        # offset = self.checkpoint.get_last_offset()
-        # batch_number = self.checkpoint.get_batch_number()
+        # Start migration
+        offset = self.checkpoint.get_last_offset()
+        batch_number = self.checkpoint.get_batch_number()
         
-        # logger.info("\nStarting migration loop...")
-        # logger.info("="*80)
+        logger.info("\nStarting migration loop...")
+        logger.info("="*80)
         
-        # with tqdm(desc="Migrating records", unit="records", 
-        #          initial=self.checkpoint.get_processed_count()) as pbar:
+        with tqdm(desc="Migrating records", unit="records", 
+                 initial=self.checkpoint.get_processed_count()) as pbar:
             
-        #     while not self.interrupted:
-        #         try:
-        #             # Fetch batch from Qdrant
-        #             logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
-        #             points_batch, next_offset = self.fetch_batch(offset)
+            while not self.interrupted:
+                try:
+                    # Fetch batch from Qdrant
+                    logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
+                    points_batch, next_offset = self.fetch_batch(offset)
                     
-        #             # Check if done
-        #             if not points_batch:
-        #                 logger.info("✓ No more data to fetch")
-        #                 break
+                    # Check if done
+                    if not points_batch:
+                        logger.info("✓ No more data to fetch")
+                        break
                     
-        #             # Convert to Endee format
-        #             records = self.convert_records(points_batch)
-        #             records_count = len(records)
-        #             self.stats["fetched"] += records_count
+                    # Convert to Endee format
+                    records = self.convert_records(points_batch)
+                    records_count = len(records)
+                    self.stats["fetched"] += records_count
                     
-        #             logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+                    logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
                     
-        #             # Upsert to Endee
-        #             logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-        #             success = self.upsert_records(records)
+                    # Upsert to Endee
+                    logger.info(f"[Batch {batch_number}] Upserting to Endee...")
+                    success = self.upsert_records(records)
                     
-        #             if success:
-        #                 # Update checkpoint
-        #                 self.checkpoint.update(batch_number, records_count, next_offset)
-        #                 self.stats["upserted"] += records_count
-        #                 self.stats["batches_processed"] += 1
+                    if success:
+                        # Update checkpoint
+                        self.checkpoint.update(batch_number, records_count, next_offset)
+                        self.stats["upserted"] += records_count
+                        self.stats["batches_processed"] += 1
                         
-        #                 # Update progress bar
-        #                 pbar.update(records_count)
+                        # Update progress bar
+                        pbar.update(records_count)
                         
-        #                 logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
-        #             else:
-        #                 self.stats["failed"] += records_count
-        #                 logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
-        #                 break
+                        logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
+                    else:
+                        self.stats["failed"] += records_count
+                        logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
+                        break
                     
-        #             # Check if done
-        #             if next_offset is None:
-        #                 logger.info("✓ Reached end of collection")
-        #                 break
+                    # Check if done
+                    if next_offset is None:
+                        logger.info("✓ Reached end of collection")
+                        break
                     
-        #             # Move to next batch
-        #             offset = next_offset
-        #             batch_number += 1
+                    # Move to next batch
+                    offset = next_offset
+                    batch_number += 1
                     
-        #         except Exception as e:
-        #             logger.error(f"[Batch {batch_number}] Exception: {e}")
-        #             import traceback
-        #             logger.error(f"Traceback: {traceback.format_exc()}")
-        #             self.stats["failed"] += records_count if 'records_count' in locals() else 0
-        #             break
+                except Exception as e:
+                    logger.error(f"[Batch {batch_number}] Exception: {e}")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    self.stats["failed"] += records_count if 'records_count' in locals() else 0
+                    break
         
-        # # Print final report
-        # self._print_final_report()
+        # Print final report
+        self._print_final_report()
     
     def _print_final_report(self):
         """Print migration summary"""
@@ -463,6 +480,8 @@ def main():
     parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY",""), help="Qdrant API key")
     parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Qdrant collection name")
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Qdrant port")
+    parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Comma-separated payload fields to use as Endee filter (e.g. category,price,year). "
+         "All other fields go to meta. If not set, everything goes to meta.")
     
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URL")
@@ -503,6 +522,7 @@ def main():
         qdrant_port=args.source_port,
         qdrant_api_key=args.source_api_key,
         qdrant_collection=args.source_collection,
+        filter_fields=args.filter_fields,
         endee_url=args.target_url,
         endee_api_key=args.target_api_key,
         endee_index=args.target_collection,

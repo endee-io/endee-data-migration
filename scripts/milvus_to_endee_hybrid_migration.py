@@ -120,7 +120,8 @@ class HybridMilvusToEndeeMigrator:
         fetch_batch_size: int = 1000,
         upsert_batch_size: int = 1000,
         space_type: str = "cosine",
-        checkpoint_file: str = "./migration_checkpoint.json"
+        checkpoint_file: str = "./migration_checkpoint.json",
+        filter_fields: str = ""
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
@@ -130,7 +131,7 @@ class HybridMilvusToEndeeMigrator:
         self.endee_index_name = endee_index
         self.fetch_batch_size = fetch_batch_size
         self.upsert_batch_size = upsert_batch_size
-        
+        self.filter_fields = set(f.strip() for f in filter_fields.split(",") if f.strip()) if filter_fields else set()
         # Collection config (will be auto-detected)
         self.space_type = space_type
         self.M = M
@@ -418,7 +419,7 @@ class HybridMilvusToEndeeMigrator:
             'id_field': id_field,
             'dense_vector_fields': dense_vector_fields,
             'sparse_vector_fields': sparse_vector_fields,
-            'other_fields': other_fields,
+            'other_fields_meta': other_fields,
             'is_hybrid': is_hybrid
         }
         
@@ -503,6 +504,13 @@ class HybridMilvusToEndeeMigrator:
         Endee format: {id, vector, sparse_indices, sparse_values, meta}
         """
         records = []
+        print(f"filter_fields:{self.filter_fields}")
+        if self.vector_field_info:
+            payload_field_names = set(i.get('name') for i in self.vector_field_info.get('other_fields_meta',{}))
+            print(f"payload_field_names:{payload_field_names}")
+            for field in self.filter_fields:
+                if field not in payload_field_names:
+                    raise ValueError(f"Field {field} not found in payload")
         for record in milvus_records:
             try:
                 # Extract ID using detected field name
@@ -512,12 +520,22 @@ class HybridMilvusToEndeeMigrator:
                 # Extract dense vector using detected field name
                 dense_vector = self.decode_vector(raw_dense_vector, self.dense_vector_field_type)
                 sparse_vector = record.get(self.sparse_vector_field_name,{})
+                print(f"filter_fields:{self.filter_fields} and payload_field_names:{payload_field_names}")
+                if self.filter_fields:
+                    filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
+                    meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
+                else:
+                    filter_data = {key:value for key, value in record.items() if key in payload_field_names}
+                    meta_data = {}
+
+                print(f"id:{record_id}, filter_data:{filter_data}, meta_data:{meta_data}")
           
                 # Build Endee record
                 endee_record = {
                     "id": record_id,
                     "vector": dense_vector,
-                    "meta": {}  # All other fields go here
+                    "filter": filter_data,
+                    "meta": meta_data  # All other fields go here
                 }
                 
                 # Extract sparse vector if present
@@ -548,13 +566,13 @@ class HybridMilvusToEndeeMigrator:
                 if self.sparse_vector_field_name:
                     excluded_fields.append(self.sparse_vector_field_name)
                 
-                for k, v in record.items():
-                    if k not in excluded_fields:
-                        # Handle complex types
-                        if isinstance(v, (dict, list)):
-                            endee_record["meta"][k] = json.dumps(v)
-                        else:
-                            endee_record["meta"][k] = v
+                # for k, v in record.items():
+                #     if k not in excluded_fields:
+                #         # Handle complex types
+                #         if isinstance(v, (dict, list)):
+                #             endee_record["meta"][k] = json.dumps(v)
+                #         else:
+                #             endee_record["meta"][k] = v
                 
                 records.append(endee_record)
                 
@@ -768,8 +786,8 @@ def main():
     parser.add_argument("--source_api_key", default=os.getenv("SOURCE_API_KEY"), help="Milvus token")
     parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Milvus collection name")
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
+    parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Filter fields")
 
-    
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URI")
     parser.add_argument("--target_api_key", default=os.getenv("TARGET_API_KEY"), help="Endee API key")
@@ -813,6 +831,7 @@ def main():
         milvus_token=args.source_api_key,
         milvus_collection=args.source_collection,
         milvus_port=args.source_port,
+        filter_fields=args.filter_fields,
         endee_url=args.target_url,
         endee_api_key=args.target_api_key,
         endee_index=args.target_collection,

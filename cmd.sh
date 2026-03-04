@@ -50,3 +50,5 @@ docker run \
   -v $(pwd)/data:/app/data \
   vector-migration:latest \
   milvus-to-endee-hybrid
+  # qdrant-to-endee-hybrid
+  # milvus-to-endee-hybrid
