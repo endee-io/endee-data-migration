@@ -122,7 +122,8 @@ class SimpleMilvusToEndeeMigrator:
         M: int = 16,
         ef_construct: int = 128,
         checkpoint_file: str = "./migration_checkpoint.json",
-        filter_fields: str = ""
+        filter_fields: str = "",
+        is_multivector: bool = False
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
@@ -139,7 +140,7 @@ class SimpleMilvusToEndeeMigrator:
         self.M = M
         self.ef_construct = ef_construct
         self.precision = Precision.FLOAT32
-        
+        self.is_multivector = is_multivector
         self.checkpoint = MigrationCheckpoint(checkpoint_file)
         self.interrupted = False
         
@@ -464,6 +465,8 @@ class SimpleMilvusToEndeeMigrator:
     def migrate(self):
         """Main migration function - simple sequential processing"""
         self.stats["start_time"] = time.time()
+        if self.is_multivector:
+            raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
         
         logger.info("="*80)
         logger.info("SIMPLE SEQUENTIAL MILVUS → ENDEE MIGRATION")
@@ -630,6 +633,9 @@ def main():
     parser.add_argument("--source_collection", default=os.getenv("SOURCE_COLLECTION"), help="Milvus collection name")
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
     parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Filter fields")
+    parser.add_argument("--is_multivector", action="store_true",
+                       default=os.getenv("IS_MULTIVECTOR",False),
+                       help="Is multivector")
 
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URI")
@@ -683,7 +689,8 @@ def main():
         M=args.M,
         ef_construct=args.ef_construct,
         checkpoint_file=args.checkpoint_file,
-        filter_fields=args.filter_fields
+        filter_fields=args.filter_fields,
+        is_multivector=args.is_multivector
     )
     
     # Clear checkpoint if requested

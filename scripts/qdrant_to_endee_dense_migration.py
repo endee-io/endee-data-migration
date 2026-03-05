@@ -12,7 +12,7 @@ import sys
 import urllib
 import os
 import dotenv
-
+import asyncio
 dotenv.load_dotenv()
 
 # Configure logging
@@ -35,7 +35,7 @@ class MigrationCheckpoint:
         """Load checkpoint from file"""
         try:
             with open(self.checkpoint_file, 'r') as f:
-                data = orjson.load(f)
+                data = orjson.loads(f.read())
                 logger.info(f"✓ Loaded checkpoint: {data.get('processed_count', 0)} records processed")
                 return data
         except FileNotFoundError:
@@ -54,9 +54,10 @@ class MigrationCheckpoint:
             }
     
     def save(self):
-        """Save checkpoint to file"""
         try:
-            os.makedirs(os.path.dirname(self.checkpoint_file), exist_ok=True)
+            dirpath = os.path.dirname(self.checkpoint_file)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
             with open(self.checkpoint_file, 'wb') as f:
                 f.write(orjson.dumps(self.data, option=orjson.OPT_INDENT_2))
         except Exception as e:
@@ -104,11 +105,13 @@ class SimpleQdrantToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
+        is_multivector: bool,
         fetch_batch_size: int = 1000,
         upsert_batch_size: int = 1000,
         checkpoint_file: str = "./migration_checkpoint.json",
         use_https: bool = False,
-        filter_fields: str = ""
+        filter_fields: str = "",
+        max_queue_size: int = 5
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
@@ -124,12 +127,13 @@ class SimpleQdrantToEndeeMigrator:
         self.use_https = use_https
         self.checkpoint = MigrationCheckpoint(checkpoint_file, use_https)
         self.interrupted = False
-
-        
+        self.is_multivector = is_multivector
+        self.max_queue_size = max_queue_size
         # Clients
         self.qdrant_client = None
         self.endee_client = None
         self.endee_index = None
+        self._stop_event = None
 
         
         # Statistics
@@ -180,8 +184,130 @@ class SimpleQdrantToEndeeMigrator:
             self.endee_client.set_base_url(url)
             logger.info(f"Set Endee base URL: {url}")
 
-        logger.info(f"{self.endee_client.list_indexes()}")
         logger.info("✓ Connected to Endee")
+    
+    async def async_producer(self, queue: asyncio.Queue):
+        """
+            THIS FUNCTION FETCH DATA FROM QDRANT AND PUT IT INTO A QUEUE FOR CONSUMER TO PROCESS
+        Args:
+            queue: asyncio.Queue
+        """
+        offset = self.checkpoint.get_last_offset()
+        batch_number = self.checkpoint.get_batch_number()
+
+        logger.info("PRODUCER STARTED FETCHING FROM QDRANT")
+
+        while not self.interrupted and not self._stop_event.is_set():
+            try:
+                # FETCH BATCH FROM QDRANT
+                logger.debug(f"FETCHING BATCH FROM QDRANT {batch_number} WITH OFFSET {offset}")
+                points_batch, next_offset = await self.async_fetch_batch(offset)
+
+                # CHECK IF POINTS BATCH IS EMPTY
+                if not points_batch:
+                    logger.info("PRODUCER: No more data to fetch")
+                    await queue.put(None)
+                    break
+                    
+                # CONVER TO ENDEE FORMAT
+                records = self.convert_records(points_batch)
+
+                # UPDATE STATS
+                self.stats["fetched"] += len(records)
+
+                # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
+                if self.interrupted:
+                    logger.info("PRODUCER: Interrupted by user")
+                    await queue.put(None)
+                    break
+
+                # PUT RECORDS INTO QUEUE
+                await queue.put({
+                    "batch_number": batch_number,
+                    "records": records,
+                    "next_offset": next_offset
+                })
+                if self._stop_event.is_set():
+                    logger.warning("PRODUCER: Stopped due to Stop Event")
+                    break
+
+                # TRACK QUEUE USAGE
+                current_size = queue.qsize()
+                if current_size > self.max_queue_size:
+                    logger.warning(f"QUEUE IS FULL. CURRENT SIZE: {current_size}")
+                    
+                # MOVE TO NEXT BATCH
+                offset = next_offset
+                batch_number  += 1
+
+                # PUT NONE TO QUEUE IF OFFSET IS NONE
+                if next_offset is None:
+                    await queue.put(None)
+                    break
+
+            except Exception as e:
+                logger.error(f"[Producer] Exception: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                await queue.put(None)  # Signal error
+                break
+        logger.info("PRODUCER FINISHED")
+    
+    async def async_consumer(self, queue: asyncio.Queue, pbar:tqdm):
+        """
+        THIS FUNCTION UPSERT DATA INTO ENDEE FROM A QUEUE
+        Args:
+            queue: asyncio.Queue
+            pbar: tqdm
+        """
+        logger.info("CONSUMER STARTED UPSERTING INTO ENDEE")
+        while not self.interrupted:
+            try:
+                # GET THE DATA FROM QUEUE
+                batch = await queue.get()
+
+                # CHECK IF DATA IS NONE THAT IS CTR+C OR TERMINAL KILL OR NO DATA PRESENT
+                if batch is None:
+                    logger.info("CONSUMER: RECEIVED END SIGNAL")
+                    queue.task_done()
+                    break
+
+                batch_number = batch.get("batch_number")
+                records = batch.get("records")
+                next_offset = batch.get("next_offset")
+                records_count = len(records)
+
+                # UPSERT TO ENDEE
+                logger.info(f"UPSERTING BATCH {batch_number} TO ENDEE")
+                start_time = time.time()
+                success = await self.async_upsert_records(records)
+                end_time = time.time()
+
+                # UPSERT SUCCESSFULLY
+                if success:
+                    # UPDATE CHECKPOINT FIELDS
+                    self.checkpoint.update(batch_number, records_count, next_offset)
+
+                    # UPDATE STATS
+                    self.stats["upserted"] += records_count
+                    self.stats["batches_processed"] += 1
+                    pbar.update(records_count)
+                    upsert_time = end_time - start_time
+                    throughput = records_count / upsert_time
+                    logger.info(f"CONSUMER: SUCCESSFULLY UPSERTED {records_count} RECORDS IN {upsert_time:.2f} seconds WITH THROUGHPUT {throughput:.2f} records/second")
+                else:
+                    self.stats["failed"] += records_count
+                    logger.error(f"CONSUMER: FAILED TO UPSERT BATCH {batch_number}")
+                    self._stop_event.set()
+                    queue.task_done()
+                    break
+                queue.task_done()
+            except Exception as e:
+                logger.error(f"[Consumer] Exception: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                break
+        logger.info("CONSUMER FINISHED")
     
     def get_qdrant_collection_info(self) -> Dict[str, Any]:
         """Get collection configuration from Qdrant"""
@@ -276,20 +402,24 @@ class SimpleQdrantToEndeeMigrator:
             self.endee_index = self.endee_client.get_index(self.endee_index_name)
             logger.info(f"✓ Created index: {self.endee_index_name}")
     
-    def fetch_batch(self, offset: Optional[Any]) -> tuple:
-        """Fetch a single batch from Qdrant"""
-        points_batch, next_offset = self.qdrant_client.scroll(
+    async def async_fetch_batch(self, offset: Optional[Any]) -> tuple:
+        """Async fetch batch from Qdrant"""
+        loop = asyncio.get_running_loop()
+        # RUN IN SEPARATE THREAD USING EVENT LOOP EXECUTOR
+        points_batch, next_offset = await loop.run_in_executor(None, lambda: self.qdrant_client.scroll(
             collection_name=self.qdrant_collection,
             limit=self.fetch_batch_size,
-            offset=offset,
-            with_payload=True,
-            with_vectors=True
+                offset=offset,
+                with_payload=True,
+                with_vectors=True
+            )
         )
         return points_batch, next_offset
     
     def convert_records(self, points) -> list:
         """Convert Qdrant points to Endee format"""
         # CHECK IF FILTER FIELDS ARE PRESENT IN THE PAYLOAD
+        records = []
         if points:
             payload = points[0].payload
             for field in self.filter_fields:
@@ -304,41 +434,76 @@ class SimpleQdrantToEndeeMigrator:
             else:
                 filter_data = payload
                 meta_data = {}
-        return [
-            {
-                "id": str(point.id),
-                "vector": point.vector,
-                "meta": meta_data,
-                "filter": filter_data
-            }
-            for point in points
-        ]
+            records.append(
+                    {
+                        "id": str(point.id),
+                        "vector": point.vector,
+                        "meta": meta_data,
+                        "filter": filter_data
+                    }
+                )
+        return records
     
-    def upsert_records(self, records: list) -> bool:
-        """Upsert records to Endee in chunks"""
-        # Split into smaller chunks if needed
-        for i in range(0, len(records), self.upsert_batch_size):
-            if self.interrupted:
-                return False
-            
-            chunk = records[i:i + self.upsert_batch_size]
-            try:
-                result = self.endee_index.upsert(chunk)
-                if not result:
-                    logger.error(f"Upsert chunk failed (returned False)")
-                    return False
-                logger.debug(f"  Upserted chunk: {len(chunk)} records")
-            except Exception as e:
-                logger.error(f"Upsert chunk exception: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                return False
+    async def async_upsert_chunk(self, chunk: list) -> bool:
+        """Upsert a chunk of records to Endee"""
+        loop = asyncio.get_running_loop()
+        try:
+            # UPSERT DOESNOT RAISE EXCEPTION ONLY RETURN STRING OF SUCCESS OR RAISE EXCEPTION IF FAILED
+            await loop.run_in_executor(None, lambda: self.endee_index.upsert(chunk))
+            return True
+        except Exception as e:
+            logger.error(f"Upsert chunk exception: {e}")
+            raise
+
+    async def async_upsert_records(self, records: list) -> bool:
+        """Async upsert records to Endee in chunks"""
+
+        if self.interrupted:
+            return False
         
+        # SPLIT INTO CHUNKS
+        chunks = [records[i:i + self.upsert_batch_size] for i in range(0, len(records), self.upsert_batch_size)]
+
+        # UPSERT CHUNKS
+        tasks = [self.async_upsert_chunk(chunk) for chunk in chunks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # FAILED RESULTS WILL HOLD CHUNK
+        failed_chunks = [chunks[i] for i, result in enumerate(results) if isinstance(result, Exception)]
+        # RETRY FAILED CHUNKS
+        while failed_chunks:
+            # POP FIRST FAILED CHUNK
+            chunk = failed_chunks.pop(0)
+            retried = False
+            for attempt in range(3):
+                try:
+                    # ASYNC UPSERT CHUNK RAISE EXCEPTION IF FAILED
+                    await self.async_upsert_chunk(chunk)
+                    retried = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Retry attempt {attempt + 1}/3 failed: {e}")
+                    await asyncio.sleep(2 ** attempt)
+
+            if not retried:
+                logger.error("Chunk failed after 3 retries. Stopping migration.")
+                return False
         return True
     
-    def migrate(self):
-        """Main migration function - simple sequential processing"""
+    async def async_migrate(self):
+        """
+            Main async migration with Producer-Consumer pattern
+            
+            How it works:
+            1. Producer fetches batches → puts in queue (max size = 5)
+            2. Consumer takes from queue → upserts to Endee
+            3. If queue is full, producer WAITS (no memory overflow!)
+            4. If queue is empty, consumer WAITS (no busy waiting!)
+        """
         self.stats["start_time"] = time.time()
+        
+        if self.is_multivector:
+            raise ValueError("Multivector mode is not supported for Qdrant to Endee dense migration")
         
         logger.info("="*80)
         logger.info("SIMPLE SEQUENTIAL MIGRATION")
@@ -362,7 +527,7 @@ class SimpleQdrantToEndeeMigrator:
         
         # Get collection config and create/verify index
         config = self.get_qdrant_collection_info()
-        print("config: ",config)
+
         self.get_or_create_endee_index(config)
         
         # Verify index is ready
@@ -371,69 +536,22 @@ class SimpleQdrantToEndeeMigrator:
         logger.info(f"Endee index ready")
         
         # Start migration
-        offset = self.checkpoint.get_last_offset()
-        batch_number = self.checkpoint.get_batch_number()
         
         logger.info("\nStarting migration loop...")
         logger.info("="*80)
+
+        # CREATE BOUNDED QUEUE WITH MAX SIZE
+        queue = asyncio.Queue(maxsize=self.max_queue_size)
+        logger.info(f"BOUNDED QUEUE CREATED WITH MAX SIZE OF {self.max_queue_size}")
         
         with tqdm(desc="Migrating records", unit="records", 
                  initial=self.checkpoint.get_processed_count()) as pbar:
+            self._stop_event = asyncio.Event()
+            await asyncio.gather(self.async_producer(queue), self.async_consumer(queue, pbar),)
             
-            while not self.interrupted:
-                try:
-                    # Fetch batch from Qdrant
-                    logger.info(f"\n[Batch {batch_number}] Fetching from Qdrant (offset: {offset})...")
-                    points_batch, next_offset = self.fetch_batch(offset)
-                    
-                    # Check if done
-                    if not points_batch:
-                        logger.info("✓ No more data to fetch")
-                        break
-                    
-                    # Convert to Endee format
-                    records = self.convert_records(points_batch)
-                    records_count = len(records)
-                    self.stats["fetched"] += records_count
-                    
-                    logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
-                    
-                    # Upsert to Endee
-                    logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-                    success = self.upsert_records(records)
-                    
-                    if success:
-                        # Update checkpoint
-                        self.checkpoint.update(batch_number, records_count, next_offset)
-                        self.stats["upserted"] += records_count
-                        self.stats["batches_processed"] += 1
-                        
-                        # Update progress bar
-                        pbar.update(records_count)
-                        
-                        logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
-                    else:
-                        self.stats["failed"] += records_count
-                        logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
-                        break
-                    
-                    # Check if done
-                    if next_offset is None:
-                        logger.info("✓ Reached end of collection")
-                        break
-                    
-                    # Move to next batch
-                    offset = next_offset
-                    batch_number += 1
-                    
-                except Exception as e:
-                    logger.error(f"[Batch {batch_number}] Exception: {e}")
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    self.stats["failed"] += records_count if 'records_count' in locals() else 0
-                    break
-        
-        # Print final report
+        logger.info("ASYNC MIGRATION COMPLETED")
+        logger.info("="*80)
+
         self._print_final_report()
     
     def _print_final_report(self):
@@ -469,6 +587,13 @@ class SimpleQdrantToEndeeMigrator:
             logger.info("Migration successful!")
         logger.info("="*80)
 
+    def migrate(self):
+        print("self.is_multivector: ",self.is_multivector)
+        if self.is_multivector:
+            raise ValueError("Multivector mode is not supported for Qdrant to Endee dense migration")
+        # RUN WILL CREATE A NEW EVENT LOOP AND RUN THE ASYNC MIGRATION
+        asyncio.run(self.async_migrate())
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -482,6 +607,12 @@ def main():
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Qdrant port")
     parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Comma-separated payload fields to use as Endee filter (e.g. category,price,year). "
          "All other fields go to meta. If not set, everything goes to meta.")
+    parser.add_argument(
+        "--is_multivector",
+        action="store_true",
+        default=os.getenv("IS_MULTIVECTOR","false").lower() == "true",
+        help="Enable multivector mode. When set, each record can contain multiple vectors instead of a single vector."
+    )
     
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URL")
@@ -515,7 +646,7 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    
+    print("args.is_multivector_before: ",args.is_multivector)
     # Create migrator
     migrator = SimpleQdrantToEndeeMigrator(
         qdrant_url=args.source_url,
@@ -529,7 +660,8 @@ def main():
         fetch_batch_size=args.batch_size,
         upsert_batch_size=args.upsert_size,
         checkpoint_file=args.checkpoint_file,
-        use_https=args.use_https
+        use_https=args.use_https,
+        is_multivector=args.is_multivector
     )
     
     # Clear checkpoint if requested
@@ -539,6 +671,7 @@ def main():
     
     # Run migration
     try:
+        print("before_migrate: ", bool(args.is_multivector))
         migrator.migrate()
     except KeyboardInterrupt:
         logger.warning("\nInterrupted by user. Progress has been saved.")
