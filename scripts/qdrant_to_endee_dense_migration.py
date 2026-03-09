@@ -200,7 +200,7 @@ class SimpleQdrantToEndeeMigrator:
         while not self.interrupted and not self._stop_event.is_set():
             try:
                 # FETCH BATCH FROM QDRANT
-                logger.debug(f"FETCHING BATCH FROM QDRANT {batch_number} WITH OFFSET {offset}")
+                logger.info(f"FETCHING BATCH FROM QDRANT {batch_number} WITH OFFSET {offset}")
                 points_batch, next_offset = await self.async_fetch_batch(offset)
 
                 # CHECK IF POINTS BATCH IS EMPTY
@@ -588,7 +588,6 @@ class SimpleQdrantToEndeeMigrator:
         logger.info("="*80)
 
     def migrate(self):
-        print("self.is_multivector: ",self.is_multivector)
         if self.is_multivector:
             raise ValueError("Multivector mode is not supported for Qdrant to Endee dense migration")
         # RUN WILL CREATE A NEW EVENT LOOP AND RUN THE ASYNC MIGRATION

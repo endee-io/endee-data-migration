@@ -13,7 +13,8 @@ import urllib
 import os
 import dotenv
 import numpy as np
-
+import asyncio
+import orjson
 dotenv.load_dotenv()
 
 # Configure logging
@@ -70,13 +71,18 @@ class MigrationCheckpoint:
     def save(self):
         """Save checkpoint to file"""
         try:
-            with open(self.checkpoint_file, 'w') as f:
-                json.dump(self.data, f, indent=2)
+            dirpath = os.path.dirname(self.checkpoint_file)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(self.checkpoint_file, 'wb') as f:
+                f.write(orjson.dumps(self.data, option=orjson.OPT_INDENT_2))
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
     
     def update(self, batch_number: int, records_count: int, offset: int):
         """Update checkpoint after successful batch"""
+        print(f"Updating checkpoint: {self.data}")
+        print("records_count: ", records_count)
         self.data["processed_count"] += records_count
         self.data["batch_number"] = batch_number
         self.data["last_offset"] = offset
@@ -105,7 +111,19 @@ class MigrationCheckpoint:
 
 
 class SimpleMilvusToEndeeMigrator:
-    """Simple sequential migration from Milvus (Dense) to Endee"""
+    """Simple sequential migration from Milvus (Dense) to Endee
+        Async producer-consumer migration from Milvus (dense) to Endee.
+
+        Architecture:
+            asyncio.run(async_migrate())
+                └── asyncio.gather(
+                        async_producer(queue),   # fetches from Milvus
+                        async_consumer(queue)    # upserts to Endee
+                    )
+
+        Both SDKs are synchronous, so every blocking call is wrapped in
+        loop.run_in_executor() to avoid freezing the event loop.
+    """
     
     def __init__(
         self,
@@ -123,7 +141,8 @@ class SimpleMilvusToEndeeMigrator:
         ef_construct: int = 128,
         checkpoint_file: str = "./migration_checkpoint.json",
         filter_fields: str = "",
-        is_multivector: bool = False
+        is_multivector: bool = False,
+        max_queue_size: int = 5
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
@@ -143,7 +162,8 @@ class SimpleMilvusToEndeeMigrator:
         self.is_multivector = is_multivector
         self.checkpoint = MigrationCheckpoint(checkpoint_file)
         self.interrupted = False
-        
+        self.max_queue_size = max_queue_size
+        self._stop_event = None
         # Field detection info (will be populated after connection)
         self.vector_field_info = None
         self.id_field_name = None
@@ -386,20 +406,45 @@ class SimpleMilvusToEndeeMigrator:
             self.endee_index = self.endee_client.get_index(self.endee_index_name)
             logger.info(f"✓ Created dense vector index: {self.endee_index_name}")
     
-    def fetch_batch(self, offset: int) -> list:
-        """Fetch a single batch from Milvus"""
+    # async def async_fetch_batch(self, offset: int) -> list:
+    #     """Fetch a single batch from Milvus"""
+    #     loop = asyncio.get_running_loop()
+    #     results = await loop.run_in_executor(None, self.milvus_client.query(
+    #         collection_name=self.milvus_collection,
+    #         filter="",
+    #         output_fields=["*"],
+    #         limit=self.fetch_batch_size,
+    #         offset=offset
+    #     ))
+    #     return results
+    async def async_fetch_batch(self, offset: int) -> list[Dict]:
+        """
+        Fetch one batch from Milvus.
+
+        milvus_client.query() is a blocking synchronous call.
+        Wrapping it in run_in_executor frees the event loop during
+        the HTTP round-trip so the consumer can upsert concurrently.
+
+        FIX: Without run_in_executor this call would freeze the event
+        loop for the entire HTTP duration — zero concurrency.
+        """
+        loop = asyncio.get_running_loop()
         try:
-            results = self.milvus_client.query(
-                collection_name=self.milvus_collection,
-                filter="",
-                output_fields=["*"],
-                limit=self.fetch_batch_size,
-                offset=offset
+            results = await loop.run_in_executor(
+                None,
+                lambda: self.milvus_client.query(
+                    collection_name=self.milvus_collection,
+                    filter="",
+                    output_fields=["*"],
+                    limit=self.fetch_batch_size,
+                    offset=offset,
+                ),
             )
-            return results
+            return results or []
         except Exception as e:
-            logger.error(f"Error fetching batch: {e}")
-            raise
+            logger.error(f"Error fetching batch at offset {offset}: {e}")
+            raise  # re-raise so producer can handle it
+
     
     def convert_records(self, milvus_records) -> list:
         records = []
@@ -411,59 +456,274 @@ class SimpleMilvusToEndeeMigrator:
                 if field not in payload_field_names:
                     raise ValueError(f"Field {field} not found in payload")
         for record in milvus_records:
-            try:
+            record_id = str(record.get(self.vector_field_info.get('id_field_meta').get('name')))
+            raw_vector = record.get(self.vector_field_info.get('vector_field_meta')[0].get('name'))
+            # ← this must be called
+            # logger.debug(f"vector_field_type={self.vector_field_type}, raw_vector type={type(raw_vector)}")
+            vector = self.decode_vector(raw_vector, self.vector_field_type)
 
-                record_id = str(record.get(self.vector_field_info.get('id_field_meta').get('name')))
-                raw_vector = record.get(self.vector_field_info.get('vector_field_meta')[0].get('name'))
-                # ← this must be called
-                # logger.debug(f"vector_field_type={self.vector_field_type}, raw_vector type={type(raw_vector)}")
-                vector = self.decode_vector(raw_vector, self.vector_field_type)
+            if self.filter_fields:
+                filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
+                meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
+            else:
+                filter_data = {key:value for key, value in record.items() if key in payload_field_names}
+                meta_data = {}
+            endee_record = {
+                "id": record_id,
+                "vector": vector,
+                "filter": filter_data,
+                "meta": meta_data
+            }
 
-                if self.filter_fields:
-                    filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
-                    meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
-                else:
-                    filter_data = {key:value for key, value in record.items() if key in payload_field_names}
-                    meta_data = {}
-                endee_record = {
-                    "id": record_id,
-                    "vector": vector,
-                    "filter": filter_data,
-                    "meta": meta_data
-                }
-
-                records.append(endee_record)
-
-            except Exception as e:
-                logger.error(f"Error converting record {record.get(self.id_field_name, 'unknown')}: {e}")
-                continue
+            records.append(endee_record)
 
         return records
     
-    def upsert_records(self, records: list) -> bool:
-        """Upsert records to Endee in chunks"""
-        # Split into smaller chunks if needed
-        for i in range(0, len(records), self.upsert_batch_size):
-            if self.interrupted:
-                return False
-            
-            chunk = records[i:i + self.upsert_batch_size]
-            try:
-                result = self.endee_index.upsert(chunk)
-                if not result:
-                    logger.error(f"Upsert chunk failed (returned False)")
-                    return False
-                logger.debug(f"  Upserted chunk: {len(chunk)} records")
-            except Exception as e:
-                logger.error(f"Upsert chunk exception: {e}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                return False
+    async def async_upsert_chunk(self, chunk: list[Dict]):
+        """
+        Upsert a single chunk to Endee.
+
+        FIX 1 — Must RAISE, not return False:
+            asyncio.gather(..., return_exceptions=True) captures raised
+            exceptions as Exception objects in the results list.
+            isinstance(False, Exception) is always False, so if this
+            method returned False the retry logic would never trigger.
+
+        FIX 2 — run_in_executor:
+            endee_index.upsert() is a blocking sync call.
+            Without the executor it would freeze the event loop.
+        """
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: self.endee_index.upsert(chunk),
+        )
+        # Endee SDK returns falsy on failure — convert to exception
+        # so gather() captures it correctly.
+        if not result:
+            raise RuntimeError(f"Endee upsert returned falsy for chunk of {len(chunk)} records")
+        logger.debug(f"  Upserted chunk: {len(chunk)} records")
+
+
+    async def async_upsert_records(self, records: list) -> bool:
+        """
+        Split records into chunks and upsert all chunks in parallel.
+        Retry each failed chunk up to 3 times with exponential backoff.
+        Returns True on full success, False if any chunk exhausts retries.
+        """
+
+        chunks = [records[i:i + self.upsert_batch_size] for i in range(0, len(records), self.upsert_batch_size)]
         
+        # PAHSE 1 : UPSERT ALL CHUNKS SIMULTANOUSLY
+        tasks = [self.async_upsert_chunk(chunk) for chunk in chunks]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # PHASE 2 : RETRY FAILED CHUNKS
+        failed_chunks = [chunks[i] for i, result in enumerate(results) if isinstance(result, Exception)]
+
+        if failed_chunks:
+            logger.warning(f"Failed to upsert {len(failed_chunks)} chunks. Retrying...")
+        
+        # PAHSE 3: RETRY FAILED CHUNKS WITH EXPONENTIAL BACKOFF
+        while failed_chunks:
+            chunk = failed_chunks.pop(0)
+            succeeded = False
+
+            for attempt in range(3):
+                try:
+                    await self.async_upsert_chunk(chunk)
+                    succeeded = True
+                    break
+                except Exception as e:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        f"  Retry attempt {attempt + 1}/3 failed: {e}. "
+                        f"Waiting {wait}s..."
+                    )
+                    # FIX: asyncio.sleep() — yields to event loop.
+                    # time.sleep() would freeze the entire event loop.
+                    await asyncio.sleep(wait)
+
+            if not succeeded:
+                logger.error(f"  Chunk of {len(chunk)} records failed after 3 retries")
+                return False
+
         return True
     
-    def migrate(self):
-        """Main migration function - simple sequential processing"""
+    async def async_producer(self, queue:asyncio.Queue):
+        """
+        Fetch batches from Milvus and put them into the queue.
+
+        Loop conditions — two checks for stop:
+          (A) while not self.interrupted and not self._stop_event.is_set()
+                checked at the TOP of every loop iteration
+          (B) if self._stop_event.is_set(): break  after queue.put()
+                closes the race window where the consumer could fail
+                 WHILE the producer is suspended inside queue.put()
+
+        Without check (B):
+          T1: Producer checks _stop_event -> False -> continues
+          T2: Producer calls await queue.put() → queue full → SUSPENDS
+          T3: Consumer fails -> _stop_event.set() -> task_done() -> unblocks producer
+          T4: Producer resumes from queue.put()
+          T5: Producer goes back to while condition -> checks _stop_event -> exits
+            Between T4 and T5 the loop body fetches one more batch from Milvus
+              a wasted network call.
+
+        With check (B):
+          T4: Producer resumes from queue.put()
+          T5: if _stop_event.is_set() -> True -> break  ← immediate, no extra fetch
+        """
+                # Start migration
+        offset = self.checkpoint.get_last_offset()
+        batch_number = self.checkpoint.get_batch_number()
+
+        logger.info("PRODUCER STARTED FETCHING FROM MILVUS")
+
+        while not self.interrupted and not self._stop_event.is_set():
+            try:
+                # FETCH BATCH FROM MILVUS
+                logger.info(f"FETCHING BATCH FROM MILVUS {batch_number} WITH OFFSET {offset}")
+                milvus_result = await self.async_fetch_batch(offset)
+
+                # CHECK IF MILVUS RESULT IS EMPTY
+                if not milvus_result or len(milvus_result) == 0:
+                    logger.info("PRODUCER: No more data to fetch")
+                    await queue.put(None)
+                    break
+                
+                # CONVERT TO ENDEE FORMAT
+                records = self.convert_records(milvus_result)
+                
+                # UPDATE STATS
+                records_count = len(records)
+                self.stats["fetched"] += records_count
+                logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+
+                # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
+                if self.interrupted:
+                    logger.info("PRODUCER: Interrupted by user")
+                    await queue.put(None)
+                    break
+
+                # PUT RECORDS INTO QUEUE
+                await queue.put({
+                    "batch_number": batch_number,
+                    "records": records,
+                    "next_offset": offset + records_count
+                })
+                
+                if self._stop_event.is_set():
+                    logger.warning("PRODUCER: Stopped due to Stop Event")
+                    break
+
+                # TRACK QUEUE USAGE
+                current_size = queue.qsize()
+                if current_size > self.max_queue_size:
+                    logger.warning(f"QUEUE IS FULL. CURRENT SIZE: {current_size}")
+
+                # MOVE TO NEXT BATCH
+                offset += records_count
+                batch_number  += 1
+
+                # # PUT NONE TO QUEUE IF OFFSET IS NONE
+                # if next_offset is None:
+                #     await queue.put(None)
+                #     break
+
+                # Show sample record structure (first batch only)
+                if batch_number == 0 and records:
+                    logger.info(f"\nSample Endee record structure:")
+                    sample = records[0].copy()
+                    # Truncate vector for display
+                    if 'vector' in sample and len(sample['vector']) > 5:
+                        sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
+                    logger.info(json.dumps(sample, indent=2))
+
+            except Exception as e:
+                logger.error(f"[Producer] Exception: {e}")
+                # import traceback
+                # logger.error(traceback.format_exc())
+                self._stop_event.set()
+                await queue.put(None)  # Signal error
+                break
+        logger.info("PRODUCER FINISHED")
+
+    async def async_consumer(self, queue: asyncio.Queue, pbar: tqdm):
+        """
+        Get batches from the queue and upsert to Endee.
+
+        The consumer does NOT check _stop_event in its while condition.
+        It is the one that SETS the flag on failure — by the time the
+        flag is set the consumer is already on the break line.
+
+        task_done() ORDER — critical to prevent deadlock:
+
+          WRONG:
+            _stop_event.set()
+            break                  ← exits without calling task_done()
+            # producer suspended in queue.put() → nobody calls task_done()
+            # queue slot never freed → queue.put() never unblocks → DEADLOCK
+
+          CORRECT (what we do):
+            _stop_event.set()      # 1. signal producer
+            queue.task_done()      # 2. unblock producer from queue.put()
+            break                  # 3. consumer exits
+        """
+        while not self.interrupted:
+            # GET BATCH FROM QUEUE
+            batch = await queue.get()
+
+            if batch is None:
+                queue.task_done()
+                logger.info("CONSUMER: RECEIVED END SIGNAL")
+                break
+            records = batch.get("records")
+            records_count = len(records)
+            batch_number = batch.get("batch_number")
+            next_offset = batch.get("next_offset")
+
+            logger.info(f"CONSUMER: RECEIVED BATCH {batch_number} WITH {records_count} RECORDS")
+            logger.info(f"CONSUMER: UPSERTING {records_count} RECORDS TO ENDEE")
+
+            success = await self.async_upsert_records(records)
+
+            if success:
+                # ── Update checkpoint ONLY on full success ─────────
+                # If we update before success, a partial failure would
+                # advance the offset and those records would never be
+                # retried — silent data loss.
+                self.checkpoint.update(batch_number, records_count, next_offset)
+                self.stats["upserted"] += records_count
+                self.stats["batches_processed"] += 1
+                pbar.update(records_count)
+                queue.task_done()  # unblock producer
+                logger.info(
+                    f"[Batch {batch_number}] ✓ Upserted {records_count} records"
+                )
+            else:
+                # ── Failure path — ORDER MATTERS ───────────────────
+                self.stats["failed"] += records_count
+                logger.error(
+                    f"[Batch {batch_number}] ✗ Failed after retries — stopping migration"
+                )
+                self._stop_event.set()   # 1. signal producer to stop
+                queue.task_done()        # 2. unblock producer from queue.put()
+                break                    # 3. consumer exits
+
+        logger.info("[Consumer] Finished")
+
+
+    async def async_migrate(self):
+        """
+            Main async migration with Producer-Consumer pattern
+            
+            How it works:
+            1. Producer fetches batches → puts in queue (max size = 5)
+            2. Consumer takes from queue → upserts to Endee
+            3. If queue is full, producer WAITS (no memory overflow!)
+            4. If queue is empty, consumer WAITS (no busy waiting!)
+        """
         self.stats["start_time"] = time.time()
         if self.is_multivector:
             raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
@@ -501,83 +761,97 @@ class SimpleMilvusToEndeeMigrator:
             raise RuntimeError("Endee index not initialized!")
         logger.info(f"✓ Endee dense vector index ready")
         
-        # Start migration
-        offset = self.checkpoint.get_last_offset()
-        batch_number = self.checkpoint.get_batch_number()
+
         
         logger.info("\nStarting migration loop...")
         logger.info("="*80)
+
+        # CREATE BOUNDED QUEUE WITH MAX SIZE
+        queue = asyncio.Queue(maxsize=self.max_queue_size)
+        logger.info(f"BOUNDED QUEUE CREATED WITH MAX SIZE OF {self.max_queue_size}")
         
         with tqdm(desc="Migrating records", unit="records", 
                  initial=self.checkpoint.get_processed_count()) as pbar:
-            
-            while not self.interrupted:
-                try:
-                    # Fetch batch from Milvus
-                    logger.info(f"\n[Batch {batch_number}] Fetching from Milvus (offset: {offset})...")
-                    milvus_results = self.fetch_batch(offset)
-                    
-                    # Check if done
-                    if not milvus_results or len(milvus_results) == 0:
-                        logger.info("✓ No more data to fetch")
-                        break
-                    
-                    # Convert to Endee format
-                    records = self.convert_records(milvus_results)
-                    records_count = len(records)
-                    self.stats["fetched"] += records_count
-                    
-                    logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
-                    
-                    # Show sample record structure (first batch only)
-                    if batch_number == 0 and records:
-                        logger.info(f"\nSample Endee record structure:")
-                        sample = records[0].copy()
-                        # Truncate vector for display
-                        if 'vector' in sample and len(sample['vector']) > 5:
-                            sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
-                        logger.info(json.dumps(sample, indent=2))
-                    
-                    # Upsert to Endee
-                    logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-                    success = self.upsert_records(records)
-                    
-                    if success:
-                        # Update offset for next batch
-                        new_offset = offset + records_count
-                        
-                        # Update checkpoint
-                        self.checkpoint.update(batch_number, records_count, new_offset)
-                        self.stats["upserted"] += records_count
-                        self.stats["batches_processed"] += 1
-                        
-                        # Update progress bar
-                        pbar.update(records_count)
-                        
-                        logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
-                        
-                        # If we got fewer results than requested, we've reached the end
-                        if len(milvus_results) < self.fetch_batch_size:
-                            logger.info(f"✓ Reached end of collection (got {len(milvus_results)} < {self.fetch_batch_size})")
-                            break
-                        
-                        # Move to next batch
-                        offset = new_offset
-                        batch_number += 1
-                    else:
-                        self.stats["failed"] += records_count
-                        logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
-                        break
-                    
-                except Exception as e:
-                    logger.error(f"[Batch {batch_number}] Exception: {e}")
-                    import traceback
-                    logger.error(f"Traceback: {traceback.format_exc()}")
-                    self.stats["failed"] += records_count if 'records_count' in locals() else 0
-                    break
-        
-        # Print final report
+
+            # CREATE STOP EVENT FOR GRACEFUL SHUTDOWN
+            # THIS IS USED TO STOP THE PRODUCER AND CONSUMER
+            self._stop_event = asyncio.Event()
+
+            # START PRODUCER AND CONSUMER
+            await asyncio.gather(self.async_producer(queue), self.async_consumer(queue, pbar),)
+
+        logger.info("ASYNC MIGRATION COMPLETED")
+        logger.info("="*80)
+
         self._print_final_report()
+
+            # while not self.interrupted:
+            #     try:
+            #         # Fetch batch from Milvus
+            #         logger.info(f"\n[Batch {batch_number}] Fetching from Milvus (offset: {offset})...")
+            #         milvus_results = self.fetch_batch(offset)
+                    
+            #         # Check if done
+            #         if not milvus_results or len(milvus_results) == 0:
+            #             logger.info("✓ No more data to fetch")
+            #             break
+                    
+            #         # Convert to Endee format
+            #         records = self.convert_records(milvus_results)
+            #         records_count = len(records)
+            #         self.stats["fetched"] += records_count
+                    
+            #         logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+                    
+            #         # Show sample record structure (first batch only)
+            #         if batch_number == 0 and records:
+            #             logger.info(f"\nSample Endee record structure:")
+            #             sample = records[0].copy()
+            #             # Truncate vector for display
+            #             if 'vector' in sample and len(sample['vector']) > 5:
+            #                 sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
+            #             logger.info(json.dumps(sample, indent=2))
+                    
+            #         # Upsert to Endee
+            #         logger.info(f"[Batch {batch_number}] Upserting to Endee...")
+            #         success = self.upsert_records(records)
+                    
+            #         if success:
+            #             # Update offset for next batch
+            #             new_offset = offset + records_count
+                        
+            #             # Update checkpoint
+            #             self.checkpoint.update(batch_number, records_count, new_offset)
+            #             self.stats["upserted"] += records_count
+            #             self.stats["batches_processed"] += 1
+                        
+            #             # Update progress bar
+            #             pbar.update(records_count)
+                        
+            #             logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
+                        
+            #             # If we got fewer results than requested, we've reached the end
+            #             if len(milvus_results) < self.fetch_batch_size:
+            #                 logger.info(f"✓ Reached end of collection (got {len(milvus_results)} < {self.fetch_batch_size})")
+            #                 break
+                        
+            #             # Move to next batch
+            #             offset = new_offset
+            #             batch_number += 1
+            #         else:
+            #             self.stats["failed"] += records_count
+            #             logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
+            #             break
+                    
+                # except Exception as e:
+                #     logger.error(f"[Batch {batch_number}] Exception: {e}")
+                #     import traceback
+                #     logger.error(f"Traceback: {traceback.format_exc()}")
+                #     self.stats["failed"] += records_count if 'records_count' in locals() else 0
+                #     break
+        
+        # # Print final report
+        # self._print_final_report()
     
     def _print_final_report(self):
         """Print migration summary"""
@@ -621,6 +895,11 @@ class SimpleMilvusToEndeeMigrator:
             logger.info("Migration successful!")
         logger.info("="*80)
 
+    def migrate(self):
+        """Wrapper Function to run the migration"""
+        if self.is_multivector:
+            raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
+        asyncio.run(self.async_migrate())
 
 def main():
     parser = argparse.ArgumentParser(
@@ -634,7 +913,7 @@ def main():
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
     parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Filter fields")
     parser.add_argument("--is_multivector", action="store_true",
-                       default=os.getenv("IS_MULTIVECTOR",False),
+                       default=os.getenv("IS_MULTIVECTOR","false").lower() == "true",
                        help="Is multivector")
 
     # Target arguments
