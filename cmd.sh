@@ -49,7 +49,7 @@ docker run \
   --env-file .env.dev \
   -v $(pwd)/data:/app/data \
   vector-migration:latest \
-  milvus-to-endee-dense
+  milvus-to-endee-hybrid
   # qdrant-to-endee-hybrid
   # qdrant-to-endee-hybrid
   # milvus-to-endee-hybrid

@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional
+import urllib
 from pymilvus import MilvusClient, DataType
 from endee import Endee, Precision
 from tqdm import tqdm
@@ -9,12 +10,12 @@ import json
 import time
 import signal
 import sys
-import urllib
 import os
 import dotenv
 import numpy as np
 import asyncio
 import orjson
+
 dotenv.load_dotenv()
 
 # Configure logging
@@ -37,7 +38,6 @@ MILVUS_STR_TO_ENDEE_PRECISION = {
     'BFLOAT16_VECTOR': Precision.FLOAT16,
     'BINARY_VECTOR':   Precision.BINARY2,
 }
-
 
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
@@ -108,19 +108,20 @@ class MigrationCheckpoint:
         self.save()
 
 
-class SimpleMilvusToEndeeMigrator:
-    """Simple sequential migration from Milvus (Dense) to Endee
-        Async producer-consumer migration from Milvus (dense) to Endee.
+class HybridMilvusToEndeeMigrator:
+    """
+        Async producer-consumer migration: Milvus (hybrid dense+sparse) → Endee.
 
         Architecture:
-            asyncio.run(async_migrate())
-                └── asyncio.gather(
-                        async_producer(queue),   # fetches from Milvus
-                        async_consumer(queue)    # upserts to Endee
-                    )
+            migrate()                        ← sync setup (connections, schema, index)
+                └── asyncio.run(async_migrate())
+                        └── asyncio.gather(
+                                async_producer(queue),
+                                async_consumer(queue, pbar)
+                            )
 
-        Both SDKs are synchronous, so every blocking call is wrapped in
-        loop.run_in_executor() to avoid freezing the event loop.
+        Both SDKs are synchronous. Every blocking call is wrapped in
+        loop.run_in_executor() so the event loop is never frozen.
     """
     
     def __init__(
@@ -131,12 +132,12 @@ class SimpleMilvusToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
+        M: int,
+        ef_construct: int,
         milvus_port: int = 19530,
         fetch_batch_size: int = 1000,
         upsert_batch_size: int = 1000,
         space_type: str = "cosine",
-        M: int = 16,
-        ef_construct: int = 128,
         checkpoint_file: str = "./migration_checkpoint.json",
         filter_fields: str = "",
         is_multivector: bool = False,
@@ -145,42 +146,45 @@ class SimpleMilvusToEndeeMigrator:
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
         self.milvus_collection = milvus_collection
-        self.milvus_port = milvus_port
         self.endee_url = endee_url
         self.endee_api_key = endee_api_key
         self.endee_index_name = endee_index
         self.fetch_batch_size = fetch_batch_size
         self.upsert_batch_size = upsert_batch_size
         self.filter_fields = set(f.strip() for f in filter_fields.split(",") if f.strip()) if filter_fields else set()
-        # Collection config
+        # Collection config (will be auto-detected)
         self.space_type = space_type
         self.M = M
         self.ef_construct = ef_construct
-        self.precision = Precision.FLOAT32
+        self.precision = Precision.FLOAT16
         self.is_multivector = is_multivector
         self.checkpoint = MigrationCheckpoint(checkpoint_file)
         self.interrupted = False
         self.max_queue_size = max_queue_size
         self._stop_event = None
-        # Field detection info (will be populated after connection)
+        # Field detection info (populated after connection)
         self.vector_field_info = None
         self.id_field_name = None
-        self.vector_field_name = None
+        self.dense_vector_field_name = None
+        self.sparse_vector_field_name = None
         self.vectors_dimension = None
+        self.sparse_dimension = None
         
         # Clients
         self.milvus_client = None
         self.endee_client = None
         self.endee_index = None
 
-        self.vector_field_type = None
-        
+        self.dense_vector_field_type=None
+
         # Statistics
         self.stats = {
             "fetched": 0,
             "upserted": 0,
             "failed": 0,
             "batches_processed": 0,
+            "records_with_sparse": 0,
+            "records_without_sparse": 0,
             "start_time": None
         }
         
@@ -202,13 +206,11 @@ class SimpleMilvusToEndeeMigrator:
         # Fix URI if needed - add protocol if missing
         uri = self.milvus_url
         if not uri.startswith(('http://', 'https://', 'tcp://', 'unix://')):
-            # If it's localhost or an IP without protocol, add http://
             if uri.startswith('localhost') or uri.replace('.', '').replace(':', '').isdigit():
                 uri = f"http://{uri}:{self.milvus_port}"
                 logger.info(f"Added protocol to URI: {uri}")
         
         self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
-        print("milvus_collections: ", self.milvus_client.list_collections())
         logger.info("✓ Connected to Milvus")
     
     def connect_endee(self):
@@ -227,6 +229,52 @@ class SimpleMilvusToEndeeMigrator:
 
         logger.info(f"{self.endee_client.list_indexes()}")
         logger.info("✓ Connected to Endee")
+    
+    def detect_sparse_dimension(self) -> int:
+        """
+        Detect actual sparse dimension by sampling records
+        Returns the maximum sparse index + 1 with some buffer
+        """
+        if not self.sparse_vector_field_name:
+            return 30000  # Default if no sparse vectors
+        
+        logger.info("\nDetecting sparse dimension from data...")
+        
+        max_index = 0
+        sample_size = min(1000, self.fetch_batch_size)
+        
+        try:
+            # Fetch a sample of records
+            sample_records = self.milvus_client.query(
+                collection_name=self.milvus_collection,
+                filter="",
+                output_fields=["*"],
+                limit=sample_size,
+                offset=0
+            )
+            
+            # Find maximum sparse index
+            for record in sample_records:
+                sparse_data = record.get(self.sparse_vector_field_name, {})
+                if sparse_data and isinstance(sparse_data, dict):
+                    indices = sparse_data.keys()
+                    if indices:
+                        record_max = max(int(idx) for idx in indices)
+                        max_index = max(max_index, record_max)
+            
+            # Add 10% buffer and round up
+            sparse_dim = int(max_index * 1.1) + 100
+            
+            logger.info(f"✓ Sampled {len(sample_records)} records")
+            logger.info(f"  - Maximum sparse index found: {max_index}")
+            logger.info(f"  - Setting sparse dimension to: {sparse_dim}")
+            
+            return sparse_dim
+            
+        except Exception as e:
+            logger.warning(f"Could not detect sparse dimension: {e}")
+            logger.warning(f"Using default sparse dimension: 30000")
+            return 30000
     
     def decode_vector(self, raw_vector, field_type):
         """Decode Milvus vector bytes to float list for Endee"""
@@ -267,10 +315,10 @@ class SimpleMilvusToEndeeMigrator:
         arr = np.frombuffer(raw_bytes, dtype=np.float16)
         return arr.astype(np.float32).tolist()
 
-    def detect_vector_field(self):
+    def detect_vector_fields(self):
         """
-        Auto-detect vector field name, ID field name, and dimension
-        Works regardless of what the fields are named
+        Auto-detect vector field names, ID field name, and dimensions
+        Handles both dense-only and hybrid (dense + sparse) collections
         """
         logger.info(f"\n{'='*80}")
         logger.info(f"Detecting fields in collection: {self.milvus_collection}")
@@ -278,9 +326,10 @@ class SimpleMilvusToEndeeMigrator:
         
         # Get collection schema
         desc = self.milvus_client.describe_collection(self.milvus_collection)
-
+        logger.info(f"desc: {desc}")
         # Storage for detected fields
-        vector_fields = []
+        dense_vector_fields = []
+        sparse_vector_fields = []
         id_field = None
         other_fields = []
         
@@ -300,23 +349,22 @@ class SimpleMilvusToEndeeMigrator:
                 }
                 self.id_field_name = field_name
                 logger.info(f"✓ ID Field (Primary Key): '{field_name}' [{field_type}]")
-
+            
             elif field_type in [DataType.BFLOAT16_VECTOR,'BFLOAT16_VECTOR']:
                 raise ValueError(
                     f"Unsupported vector type: BFLOAT16_VECTOR in field '{field_name}'. "
                     f"Endee does not support BFLOAT16 precision. "
                     f"Please convert your vectors to FLOAT32 or FLOAT16 before migrating."
                 )
-
-            # Detect vector fields
+            
+            # Detect dense vector fields
             elif field_type in ['FLOAT_VECTOR', 'FLOAT16_VECTOR', 'BINARY_VECTOR',
                     DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, 
                      DataType.BINARY_VECTOR]:
                 index_info = self.milvus_client.describe_index(self.milvus_collection, field_name)
-                self.ef_construct = index_info.get('params', {}).get('efConstruction', self.ef_construct)
-                self.M = index_info.get('params', {}).get('M', self.M)
                 params = field.get('params', {})
                 dim = params.get('dim') or field.get('dim')
+
                 
                 # Detect precision from field type
                 precision = (
@@ -325,20 +373,35 @@ class SimpleMilvusToEndeeMigrator:
                     Precision.FLOAT32  # fallback
                 )
                 
-                vector_fields.append({
+                dense_vector_fields.append({
                     'name': field_name,
                     'type': field_type,
                     'dimension': dim,
                     'precision': precision   # ← store per vector field
                 })
                 
-                # Use the first vector field found
-                if self.vector_field_name is None:
-                    self.vector_field_name = field_name
+                self.ef_construct = index_info.get('params', {}).get('efConstruction', self.ef_construct)
+                self.M = index_info.get('params', {}).get('M', self.M)
+
+                # Use the first dense vector field found
+                if self.dense_vector_field_name is None:
+                    self.dense_vector_field_name = field_name
                     self.vectors_dimension = dim
                     self.precision = precision  # ← set on self
+                logger.info(f"✓ Dense Vector Field: '{field_name}' [{field_type}, dim={dim}]")
+            
+            # Detect sparse vector fields
+            elif field_type in ['SPARSE_FLOAT_VECTOR', DataType.SPARSE_FLOAT_VECTOR]:
+                sparse_vector_fields.append({
+                    'name': field_name,
+                    'type': field_type
+                })
                 
-                logger.info(f"✓ Vector Field: '{field_name}' [{field_type}, dim={dim}, precision={precision}]")
+                # Use the first sparse vector field found
+                if self.sparse_vector_field_name is None:
+                    self.sparse_vector_field_name = field_name
+                
+                logger.info(f"✓ Sparse Vector Field: '{field_name}' [{field_type}]")
             
             # Other fields
             else:
@@ -351,11 +414,16 @@ class SimpleMilvusToEndeeMigrator:
         logger.info("-" * 80)
         logger.info(f"\nSUMMARY:")
         logger.info(f"  Primary Key: {id_field['name'] if id_field else 'NOT FOUND'}")
-        logger.info(f"  Vector Fields: {len(vector_fields)}")
+        logger.info(f"  Dense Vector Fields: {len(dense_vector_fields)}")
         
-        if vector_fields:
-            for vf in vector_fields:
+        if dense_vector_fields:
+            for vf in dense_vector_fields:
                 logger.info(f"    - {vf['name']} (dim={vf['dimension']})")
+        
+        logger.info(f"  Sparse Vector Fields: {len(sparse_vector_fields)}")
+        if sparse_vector_fields:
+            for sf in sparse_vector_fields:
+                logger.info(f"    - {sf['name']}")
         
         logger.info(f"  Metadata Fields: {len(other_fields)}")
         if other_fields:
@@ -364,215 +432,89 @@ class SimpleMilvusToEndeeMigrator:
         
         logger.info(f"\n{'='*80}\n")
         
+        # Determine if hybrid or dense-only
+        is_hybrid = len(sparse_vector_fields) > 0
+        logger.info(f"Collection Type: {'HYBRID (Dense + Sparse)' if is_hybrid else 'DENSE ONLY'}")
+        
         self.vector_field_info = {
-            'id_field_meta': id_field,
-            'vector_field_meta': vector_fields,
-            'other_fields_meta': other_fields
+            'id_field': id_field,
+            'dense_vector_fields': dense_vector_fields,
+            'sparse_vector_fields': sparse_vector_fields,
+            'other_fields_meta': other_fields,
+            'is_hybrid': is_hybrid
         }
-
-        print("vector_field_info: ", self.vector_field_info)
+        
         if not self.id_field_name:
             raise ValueError("No primary key field found in collection")
-        if not self.vector_field_name:
-            raise ValueError("No vector field found in collection")
+        if not self.dense_vector_field_name:
+            raise ValueError("No dense vector field found in collection")
         
         return self.vector_field_info
     
     def get_or_create_endee_index(self):
-        """Get or create Endee dense vector index"""
+        """Get or create Endee index (hybrid or dense-only based on detection)"""
         if not self.vectors_dimension:
-            raise ValueError("Vector dimension not detected. Run detect_vector_field() first.")
+            raise ValueError("Vector dimension not detected. Run detect_vector_fields() first.")
+        
+        is_hybrid = self.vector_field_info.get('is_hybrid', False)
         
         try:
             self.endee_index = self.endee_client.get_index(self.endee_index_name)
             logger.info(f"✓ Index already exists: {self.endee_index_name}")
         except NotFoundException:
-            logger.info(f"Creating dense vector index: {self.endee_index_name}")
-            logger.info(f"  - Dimension: {self.vectors_dimension}")
-            logger.info(f"  - Space type: {self.space_type}")
-            logger.info(f"  - M: {self.M}")
-            logger.info(f"  - ef_construct: {self.ef_construct}")
-            
-            self.endee_client.create_index(
-                name=self.endee_index_name,
-                dimension=self.vectors_dimension,
-                space_type=self.space_type,
-                M=self.M,
-                ef_con=self.ef_construct,
-                precision=self.precision
-            )
-            self.endee_index = self.endee_client.get_index(self.endee_index_name)
-            logger.info(f"✓ Created dense vector index: {self.endee_index_name}")
-    
-    # async def async_fetch_batch(self, offset: int) -> list:
-    #     """Fetch a single batch from Milvus"""
-    #     loop = asyncio.get_running_loop()
-    #     results = await loop.run_in_executor(None, self.milvus_client.query(
-    #         collection_name=self.milvus_collection,
-    #         filter="",
-    #         output_fields=["*"],
-    #         limit=self.fetch_batch_size,
-    #         offset=offset
-    #     ))
-    #     return results
-    async def async_fetch_batch(self, offset: int) -> list[Dict]:
-        """
-        Fetch one batch from Milvus.
-
-        milvus_client.query() is a blocking synchronous call.
-        Wrapping it in run_in_executor frees the event loop during
-        the HTTP round-trip so the consumer can upsert concurrently.
-
-        FIX: Without run_in_executor this call would freeze the event
-        loop for the entire HTTP duration — zero concurrency.
-        """
-        loop = asyncio.get_running_loop()
-        try:
-            results = await loop.run_in_executor(
-                None,
-                lambda: self.milvus_client.query(
-                    collection_name=self.milvus_collection,
-                    filter="",
-                    output_fields=["*"],
-                    limit=self.fetch_batch_size,
-                    offset=offset,
-                ),
-            )
-            return results or []
-        except Exception as e:
-            logger.error(f"Error fetching batch at offset {offset}: {e}")
-            raise  # re-raise so producer can handle it
-
-    
-    def convert_records(self, milvus_records) -> list:
-        records = []
-
-        # CHECK IF FILTER FIELDS ARE PRESENT IN THE PAYLOAD
-        if self.vector_field_info:
-            payload_field_names = set(i.get('name') for i in self.vector_field_info.get('other_fields_meta',{}))
-            for field in self.filter_fields:
-                if field not in payload_field_names:
-                    raise ValueError(f"Field {field} not found in payload")
-        for record in milvus_records:
-            record_id = str(record.get(self.vector_field_info.get('id_field_meta').get('name')))
-            raw_vector = record.get(self.vector_field_info.get('vector_field_meta')[0].get('name'))
-            # ← this must be called
-            # logger.debug(f"vector_field_type={self.vector_field_type}, raw_vector type={type(raw_vector)}")
-            vector = self.decode_vector(raw_vector, self.vector_field_type)
-
-            if self.filter_fields:
-                filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
-                meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
+            if is_hybrid:
+                # Detect actual sparse dimension from data
+                self.sparse_dimension = self.detect_sparse_dimension()
+                
+                logger.info(f"Creating HYBRID index: {self.endee_index_name} {type(self.endee_index_name)}")
+                logger.info(f"  - Dense dimension: {self.vectors_dimension} {type(self.vectors_dimension)}")
+                logger.info(f"  - Sparse dimension: {self.sparse_dimension} {type(self.sparse_dimension)}")
+                logger.info(f"  - Space type: {self.space_type} {type(self.space_type)}")
+                logger.info(f"  - M: {self.M} {type(self.M)}")
+                logger.info(f"  - ef_construct: {self.ef_construct} {type(self.ef_construct)}")
+                logger.info(f"  - Precision: {self.precision} {type(self.precision)}")
+                logger.info(f"  - Creating Index")
+                self.endee_client.create_index(
+                    name=self.endee_index_name,
+                    dimension=self.vectors_dimension,
+                    space_type=self.space_type,
+                    sparse_dim=self.sparse_dimension,
+                    M=self.M,
+                    ef_con=self.ef_construct,
+                    precision=self.precision
+                )
+                logger.info(f"✓ Created HYBRID index: {self.endee_index_name}")
             else:
-                filter_data = {key:value for key, value in record.items() if key in payload_field_names}
-                meta_data = {}
-            endee_record = {
-                "id": record_id,
-                "vector": vector,
-                "filter": filter_data,
-                "meta": meta_data
-            }
-
-            records.append(endee_record)
-
-        return records
+                logger.info(f"Creating DENSE index: {self.endee_index_name}")
+                logger.info(f"  - Dimension: {self.vectors_dimension}")
+                logger.info(f"  - Space type: {self.space_type}")
+                logger.info(f"  - M: {self.M}")
+                logger.info(f"  - ef_construct: {self.ef_construct}")
+                
+                self.endee_client.create_index(
+                    name=self.endee_index_name,
+                    dimension=self.vectors_dimension,
+                    space_type=self.space_type,
+                    M=self.M,
+                    ef_con=self.ef_construct,
+                    precision=self.precision
+                )
+                logger.info(f"✓ Created DENSE index: {self.endee_index_name}")
+            
+            self.endee_index = self.endee_client.get_index(self.endee_index_name)
+            logger.info(f"✓ Created Endee index: {self.endee_index_name}")
     
-    async def async_upsert_chunk(self, chunk: list[Dict]):
+
+    async def async_producer(self, queue: asyncio.Queue):
         """
-        Upsert a single chunk to Endee.
+            Fetch batches from Milvus and put them into the queue.
 
-        FIX 1 — Must RAISE, not return False:
-            asyncio.gather(..., return_exceptions=True) captures raised
-            exceptions as Exception objects in the results list.
-            isinstance(False, Exception) is always False, so if this
-            method returned False the retry logic would never trigger.
+        Two stop checks:
+          (A) while condition — top of every iteration
+          (B) post-put check — closes race window where consumer fails
+              WHILE producer is suspended inside await queue.put()
 
-        FIX 2 — run_in_executor:
-            endee_index.upsert() is a blocking sync call.
-            Without the executor it would freeze the event loop.
         """
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: self.endee_index.upsert(chunk),
-        )
-        # Endee SDK returns falsy on failure — convert to exception
-        # so gather() captures it correctly.
-        if not result:
-            raise RuntimeError(f"Endee upsert returned falsy for chunk of {len(chunk)} records")
-        logger.debug(f"  Upserted chunk: {len(chunk)} records")
-
-
-    async def async_upsert_records(self, records: list) -> bool:
-        """
-        Split records into chunks and upsert all chunks in parallel.
-        Retry each failed chunk up to 3 times with exponential backoff.
-        Returns True on full success, False if any chunk exhausts retries.
-        """
-
-        chunks = [records[i:i + self.upsert_batch_size] for i in range(0, len(records), self.upsert_batch_size)]
-        
-        # PAHSE 1 : UPSERT ALL CHUNKS SIMULTANOUSLY
-        tasks = [self.async_upsert_chunk(chunk) for chunk in chunks]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # PHASE 2 : RETRY FAILED CHUNKS
-        failed_chunks = [chunks[i] for i, result in enumerate(results) if isinstance(result, Exception)]
-
-        if failed_chunks:
-            logger.warning(f"Failed to upsert {len(failed_chunks)} chunks. Retrying...")
-        
-        # PAHSE 3: RETRY FAILED CHUNKS WITH EXPONENTIAL BACKOFF
-        while failed_chunks:
-            chunk = failed_chunks.pop(0)
-            succeeded = False
-
-            for attempt in range(3):
-                try:
-                    await self.async_upsert_chunk(chunk)
-                    succeeded = True
-                    break
-                except Exception as e:
-                    wait = 2 ** attempt  # 1s, 2s, 4s
-                    logger.warning(
-                        f"  Retry attempt {attempt + 1}/3 failed: {e}. "
-                        f"Waiting {wait}s..."
-                    )
-                    # FIX: asyncio.sleep() — yields to event loop.
-                    # time.sleep() would freeze the entire event loop.
-                    await asyncio.sleep(wait)
-
-            if not succeeded:
-                logger.error(f"  Chunk of {len(chunk)} records failed after 3 retries")
-                return False
-
-        return True
-    
-    async def async_producer(self, queue:asyncio.Queue):
-        """
-        Fetch batches from Milvus and put them into the queue.
-
-        Loop conditions — two checks for stop:
-          (A) while not self.interrupted and not self._stop_event.is_set()
-                checked at the TOP of every loop iteration
-          (B) if self._stop_event.is_set(): break  after queue.put()
-                closes the race window where the consumer could fail
-                 WHILE the producer is suspended inside queue.put()
-
-        Without check (B):
-          T1: Producer checks _stop_event -> False -> continues
-          T2: Producer calls await queue.put() → queue full → SUSPENDS
-          T3: Consumer fails -> _stop_event.set() -> task_done() -> unblocks producer
-          T4: Producer resumes from queue.put()
-          T5: Producer goes back to while condition -> checks _stop_event -> exits
-            Between T4 and T5 the loop body fetches one more batch from Milvus
-              a wasted network call.
-
-        With check (B):
-          T4: Producer resumes from queue.put()
-          T5: if _stop_event.is_set() -> True -> break  ← immediate, no extra fetch
-        """
-                # Start migration
         offset = self.checkpoint.get_last_offset()
         batch_number = self.checkpoint.get_batch_number()
 
@@ -581,26 +523,24 @@ class SimpleMilvusToEndeeMigrator:
         while not self.interrupted and not self._stop_event.is_set():
             try:
                 # FETCH BATCH FROM MILVUS
-                logger.info(f"FETCHING BATCH FROM MILVUS {batch_number} WITH OFFSET {offset}")
-                milvus_result = await self.async_fetch_batch(offset)
+                logger.info(f"FETCHING BATCH FROM QDRANT {batch_number} WITH OFFSET {offset}")
+                points_batch, next_offset = await self.async_fetch_batch(offset)
 
-                # CHECK IF MILVUS RESULT IS EMPTY
-                if not milvus_result or len(milvus_result) == 0:
-                    logger.info("PRODUCER: No more data to fetch")
+                # CHECK IF POINTS BATCH IS EMPTY
+                if not points_batch:
+                    logger.info("PRODUCER: NO MORE DATA TO FETCH")
                     await queue.put(None)
                     break
-                
+
                 # CONVERT TO ENDEE FORMAT
-                records = self.convert_records(milvus_result)
-                
+                records = self.convert_records(points_batch)
+
                 # UPDATE STATS
-                records_count = len(records)
-                self.stats["fetched"] += records_count
-                logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+                self.stats["fetched"] += len(records)
 
                 # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
                 if self.interrupted:
-                    logger.info("PRODUCER: Interrupted by user")
+                    logger.info("PRODUCER: INTERRUPTED BY USER")
                     await queue.put(None)
                     break
 
@@ -608,130 +548,272 @@ class SimpleMilvusToEndeeMigrator:
                 await queue.put({
                     "batch_number": batch_number,
                     "records": records,
-                    "next_offset": offset + records_count
+                    "next_offset": next_offset
                 })
                 
                 if self._stop_event.is_set():
-                    logger.warning("PRODUCER: Stopped due to Stop Event")
+                    logger.warning("PRODUCER: STOPPED DUE TO STOP EVENT")
                     break
 
                 # TRACK QUEUE USAGE
                 current_size = queue.qsize()
                 if current_size > self.max_queue_size:
                     logger.warning(f"QUEUE IS FULL. CURRENT SIZE: {current_size}")
-
+                    
                 # MOVE TO NEXT BATCH
-                offset += records_count
-                batch_number  += 1
+                offset = next_offset
+                batch_number += 1
 
-                # # PUT NONE TO QUEUE IF OFFSET IS NONE
-                # if next_offset is None:
-                #     await queue.put(None)
-                #     break
-
-                # Show sample record structure (first batch only)
-                if batch_number == 0 and records:
-                    logger.info(f"\nSample Endee record structure:")
-                    sample = records[0].copy()
-                    # Truncate vector for display
-                    if 'vector' in sample and len(sample['vector']) > 5:
-                        sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
-                    logger.info(json.dumps(sample, indent=2))
+                # PUT NONE TO QUEUE IF OFFSET IS NONE
+                if next_offset is None:
+                    await queue.put(None)
+                    break
 
             except Exception as e:
                 logger.error(f"[Producer] Exception: {e}")
-                # import traceback
-                # logger.error(traceback.format_exc())
                 self._stop_event.set()
                 await queue.put(None)  # Signal error
                 break
         logger.info("PRODUCER FINISHED")
 
-    async def async_consumer(self, queue: asyncio.Queue, pbar: tqdm):
+    async def async_consumer(self, queue: asyncio.Queue, pbar:tqdm):
         """
-        Get batches from the queue and upsert to Endee.
+            Get batches from queue and upsert to Endee.
 
-        The consumer does NOT check _stop_event in its while condition.
-        It is the one that SETS the flag on failure — by the time the
-        flag is set the consumer is already on the break line.
+            task_done() ORDER on failure — prevents deadlock (BUG 3 fix):
 
-        task_done() ORDER — critical to prevent deadlock:
+            WRONG:
+                self._stop_event.set()
+                break                   ← exits without task_done()
+                # producer blocked in queue.put() → DEADLOCK forever
 
-          WRONG:
-            _stop_event.set()
-            break                  ← exits without calling task_done()
-            # producer suspended in queue.put() → nobody calls task_done()
-            # queue slot never freed → queue.put() never unblocks → DEADLOCK
+            CORRECT:
+                self._stop_event.set()  # 1. signal producer to stop
+                queue.task_done()       # 2. unblock producer from queue.put()
+                break                   # 3. consumer exits cleanly
 
-          CORRECT (what we do):
-            _stop_event.set()      # 1. signal producer
-            queue.task_done()      # 2. unblock producer from queue.put()
-            break                  # 3. consumer exits
+            Same order in the exception handler.
         """
+        logger.info("CONSUMER STARTED UPSERTING INTO ENDEE")
         while not self.interrupted:
-            # GET BATCH FROM QUEUE
-            batch = await queue.get()
+            try:
+                # GET THE DATA FROM QUEUE
+                batch = await queue.get()
 
-            if batch is None:
-                queue.task_done()
-                logger.info("CONSUMER: RECEIVED END SIGNAL")
-                break
-            records = batch.get("records")
-            records_count = len(records)
-            batch_number = batch.get("batch_number")
-            next_offset = batch.get("next_offset")
+                # CHECK IF DATA IS NONE THAT IS CTRL+C OR TERMINAL KILL OR NO DATA PRESENT
+                if batch is None:
+                    logger.info("CONSUMER: RECEIVED END SIGNAL")
+                    queue.task_done()
+                    break
 
-            logger.info(f"CONSUMER: RECEIVED BATCH {batch_number} WITH {records_count} RECORDS")
-            logger.info(f"CONSUMER: UPSERTING {records_count} RECORDS TO ENDEE")
+                batch_number = batch.get("batch_number")
+                records = batch.get("records")
+                next_offset = batch.get("next_offset")
+                records_count = len(records)
 
-            success = await self.async_upsert_records(records)
+                # UPSERT TO ENDEE
+                logger.info(f"UPSERTING BATCH {batch_number} TO ENDEE")
+                start_time = time.time()
+                success = await self.async_upsert_records(records)
+                end_time = time.time()
+                elapsed = end_time - start_time
+                # UPSERT SUCCESSFULLY
+                if success:
+                    # UPDATE CHECKPOINT FIELDS
+                    self.checkpoint.update(batch_number, records_count, next_offset)
+                    # UPDATE STATS
+                    self.stats["upserted"] += records_count
+                    self.stats["batches_processed"] += 1
+                    pbar.update(records_count)
+                    throughput = records_count / elapsed if elapsed > 0 else 0
+                    logger.info(
+                        f"CONSUMER: batch {batch_number} ✓ — "
+                        f"{records_count} records in {elapsed:.2f}s "
+                        f"({throughput:.0f} rec/s)"
+                    )
+                    queue.task_done()
+                else:
+                    self.stats["failed"] += records_count
+                    logger.error(f"CONSUMER: batch {batch_number} ✗ — failed after retries")
+                    self._stop_event.set()   # 1. signal producer   ← BUG 3 fix
+                    queue.task_done()        # 2. unblock producer
+                    break                    # 3. exit
 
-            if success:
-                # ── Update checkpoint ONLY on full success ─────────
-                # If we update before success, a partial failure would
-                # advance the offset and those records would never be
-                # retried — silent data loss.
-                self.checkpoint.update(batch_number, records_count, next_offset)
-                self.stats["upserted"] += records_count
-                self.stats["batches_processed"] += 1
-                pbar.update(records_count)
-                queue.task_done()  # unblock producer
-                logger.info(
-                    f"[Batch {batch_number}] ✓ Upserted {records_count} records"
-                )
-            else:
-                # ── Failure path — ORDER MATTERS ───────────────────
-                self.stats["failed"] += records_count
-                logger.error(
-                    f"[Batch {batch_number}] ✗ Failed after retries — stopping migration"
-                )
-                self._stop_event.set()   # 1. signal producer to stop
-                queue.task_done()        # 2. unblock producer from queue.put()
-                break                    # 3. consumer exits
+            except Exception as e:
+                logger.error(f"CONSUMER: exception — {e}")
+                self._stop_event.set()       # 1. signal producer   ← BUG 3 fix
+                queue.task_done()            # 2. unblock producer
+                break   
+        
+        logger.info("CONSUMER FINISHED")
 
-        logger.info("[Consumer] Finished")
+    async def async_fetch_batch(self, offset: int) -> list:
+        """Fetch a single batch from Milvus"""
+        loop = asyncio.get_running_loop()
+        try:
+            # RUN IN SEPARATE THREAD USING EVENT LOOP EXECUTOR
+            result = await loop.run_in_executor(None, lambda: self.milvus_client.query(
+                collection_name=self.milvus_collection,
+                filter="",
+                output_fields=["*"],
+                limit=self.fetch_batch_size,
+                offset=offset
+            ))
+            return result or []
+        except Exception as e:
+            logger.error(f"Error fetching batch: {e}")
+            raise # RE-RAISE SO PRODUCER CAN HANDLE IT  
+    
+    def convert_records(self, milvus_records) -> list:
+        """
+        Convert Milvus records to Endee format
+        Endee format: {id, vector, sparse_indices, sparse_values, meta}
+        """
+        records = []
+        if self.vector_field_info:
+            payload_field_names = set(i.get('name') for i in self.vector_field_info.get('other_fields_meta',{}))
+            print(f"payload_field_names:{payload_field_names}")
+            for field in self.filter_fields:
+                if field not in payload_field_names:
+                    raise ValueError(f"Field {field} not found in payload")
+        for record in milvus_records:
+            try:
+                # Extract ID using detected field name
+                record_id = str(record.get(self.id_field_name, ''))
+                raw_dense_vector = record.get(self.dense_vector_field_name, [])
 
+                # Extract dense vector using detected field name
+                dense_vector = self.decode_vector(raw_dense_vector, self.dense_vector_field_type)
+                # sparse_vector = record.get(self.sparse_vector_field_name,{})
+                if self.filter_fields:
+                    filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
+                    meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
+                else:
+                    filter_data = {key:value for key, value in record.items() if key in payload_field_names}
+                    meta_data = {}
+          
+                # Build Endee record
+                endee_record = {
+                    "id": record_id,
+                    "vector": dense_vector,
+                    "filter": filter_data,
+                    "meta": meta_data  # All other fields go here
+                }
+                
+                # Extract sparse vector if present
+                if self.sparse_vector_field_name:
+                    sparse_data = record.get(self.sparse_vector_field_name, {})
+                    
+                    if sparse_data and isinstance(sparse_data, dict):
+                        # Convert dict {index: value} to separate lists
+                        indices = []
+                        values = []
+                        
+                        for idx, val in sorted(sparse_data.items()):
+                            indices.append(int(idx))
+                            values.append(float(val))
+                        
+                        if indices:
+                            endee_record["sparse_indices"] = indices
+                            endee_record["sparse_values"] = values
+                            self.stats["records_with_sparse"] += 1
+                        else:
+                            self.stats["records_without_sparse"] += 1
+                    else:
+                        self.stats["records_without_sparse"] += 1
+                
+                # Add all other fields to meta
+                # Exclude: ID, dense vector, sparse vector
+                excluded_fields = [self.id_field_name, self.dense_vector_field_name]
+                if self.sparse_vector_field_name:
+                    excluded_fields.append(self.sparse_vector_field_name)
+                
+                # for k, v in record.items():
+                #     if k not in excluded_fields:
+                #         # Handle complex types
+                #         if isinstance(v, (dict, list)):
+                #             endee_record["meta"][k] = json.dumps(v)
+                #         else:
+                #             endee_record["meta"][k] = v
+                
+                records.append(endee_record)
+                
+            except Exception as e:
+                logger.error(f"Error converting record {record.get(self.id_field_name, 'unknown')}: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Skip this record and continue
+                continue
+        
+        return records
+    
+    async def async_upsert_chunk(self, chunk: list) -> bool:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: self.endee_index.upsert(chunk))
+            return True
+        except Exception as e:
+            logger.error(f"Upsert chunk exception: {e}")
+            raise
 
+    async def async_upsert_records(self, records: list) -> bool:
+        """Upsert records to Endee in chunks
+        - splits into chunks
+        - upserts all chunks in parallel via gather()
+        - retries each failed chunk with exponential backoff
+        """
+        if self.interrupted:
+            return False
+
+        chunks = [records[i:i + self.upsert_batch_size] for i in range(0, len(records), self.upsert_batch_size)]
+
+        # PHASE 1: ALL CHUNKS IN PARALLEL
+        results = await asyncio.gather(
+            *[self.async_upsert_chunk(c) for c in chunks],
+            return_exceptions=True
+        )
+
+        # PHASE 2: COLLECT FAILURES
+        failed_chunks = [
+            chunks[i] for i, result in enumerate(results) if isinstance(result, Exception)
+        ]
+        if failed_chunks:
+            logger.warning(f"Failed to upsert {len(failed_chunks)} chunks. Retrying...")
+
+        # PHASE 3: RETRY WITH EXPONENTIAL BACKOFF
+        while failed_chunks:
+            chunk = failed_chunks.pop(0)
+            succeeded = False
+            for attempt in range(3):
+                try:
+                    await self.async_upsert_chunk(chunk)
+                    succeeded = True
+                    logger.info(f"  Retry {attempt + 1} succeeded ({len(chunk)} records)")
+                    break
+                except Exception as e:
+                    wait = 2 ** attempt
+                    logger.warning(f"  Retry {attempt + 1}/3 failed: {e}. Waiting {wait}s...")
+                    await asyncio.sleep(wait)   # non-blocking — yields to event loop
+            if not succeeded:
+                logger.error(f"  Chunk of {len(chunk)} exhausted 3 retries")
+                return False
+
+        return True
+    
+      # ══════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════
+    # ASYNC ORCHESTRATOR
+    # ══════════════════════════════════════════════════════════════
     async def async_migrate(self):
-        """
-            Main async migration with Producer-Consumer pattern
-            
-            How it works:
-            1. Producer fetches batches → puts in queue (max size = 5)
-            2. Consumer takes from queue → upserts to Endee
-            3. If queue is full, producer WAITS (no memory overflow!)
-            4. If queue is empty, consumer WAITS (no busy waiting!)
-        """
+        """Main migration function"""
         self.stats["start_time"] = time.time()
         if self.is_multivector:
-            raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
-        
+            raise ValueError("Multivector mode is not supported for Milvus to Endee hybrid migration")
         logger.info("="*80)
-        logger.info("SIMPLE SEQUENTIAL MILVUS → ENDEE MIGRATION")
+        logger.info("MILVUS → ENDEE MIGRATION (AUTO-DETECT HYBRID/DENSE)")
         logger.info("="*80)
         logger.info(f"Source: {self.milvus_collection} @ {self.milvus_url}")
         logger.info(f"Target: {self.endee_index_name}")
-        logger.info(f"Format: Dense vectors with metadata (payload)")
         logger.info(f"Fetch batch size: {self.fetch_batch_size}")
         logger.info(f"Upsert batch size: {self.upsert_batch_size}")
         logger.info("="*80)
@@ -746,37 +828,38 @@ class SimpleMilvusToEndeeMigrator:
         
         # Setup connections
         self.connect_milvus()
+        logger.info(f"milvus connected")
         self.connect_endee()
-        
-        # Detect field names and dimensions from Milvus schema
-        self.detect_vector_field()
-        
-        # Create/verify Endee index with detected dimension
+        logger.info(f"endee connected")
+        # Detect field names and types from Milvus schema
+        self.detect_vector_fields()
+        logger.info(f"vector fields detected")
+        # Create/verify Endee index with detected configuration
         self.get_or_create_endee_index()
-        
+        logger.info(f"endee_index: {self.endee_index}")
         # Verify index is ready
         if self.endee_index is None:
             raise RuntimeError("Endee index not initialized!")
-        logger.info(f"✓ Endee dense vector index ready")
+        logger.info(f"✓ Endee index ready")
         
-
+        # Start migration
+        offset = self.checkpoint.get_last_offset()
+        batch_number = self.checkpoint.get_batch_number()
         
         logger.info("\nStarting migration loop...")
         logger.info("="*80)
 
-        # CREATE BOUNDED QUEUE WITH MAX SIZE
         queue = asyncio.Queue(maxsize=self.max_queue_size)
         logger.info(f"BOUNDED QUEUE CREATED WITH MAX SIZE OF {self.max_queue_size}")
         
         with tqdm(desc="Migrating records", unit="records", 
                  initial=self.checkpoint.get_processed_count()) as pbar:
-
+            
             # CREATE STOP EVENT FOR GRACEFUL SHUTDOWN
             # THIS IS USED TO STOP THE PRODUCER AND CONSUMER
             self._stop_event = asyncio.Event()
-
             # START PRODUCER AND CONSUMER
-            await asyncio.gather(self.async_producer(queue), self.async_consumer(queue, pbar),)
+            await asyncio.gather(self.async_producer(queue), self.async_consumer(queue, pbar))
 
         logger.info("ASYNC MIGRATION COMPLETED")
         logger.info("="*80)
@@ -805,9 +888,13 @@ class SimpleMilvusToEndeeMigrator:
             #         if batch_number == 0 and records:
             #             logger.info(f"\nSample Endee record structure:")
             #             sample = records[0].copy()
-            #             # Truncate vector for display
+            #             # Truncate vectors for display
             #             if 'vector' in sample and len(sample['vector']) > 5:
             #                 sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
+            #             if 'sparse_indices' in sample and len(sample['sparse_indices']) > 5:
+            #                 sample['sparse_indices'] = f"{sample['sparse_indices'][:5]}... ({len(sample['sparse_indices'])} items)"
+            #             if 'sparse_values' in sample and len(sample['sparse_values']) > 5:
+            #                 sample['sparse_values'] = f"{sample['sparse_values'][:5]}... ({len(sample['sparse_values'])} items)"
             #             logger.info(json.dumps(sample, indent=2))
                     
             #         # Upsert to Endee
@@ -841,14 +928,14 @@ class SimpleMilvusToEndeeMigrator:
             #             logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
             #             break
                     
-                # except Exception as e:
-                #     logger.error(f"[Batch {batch_number}] Exception: {e}")
-                #     import traceback
-                #     logger.error(f"Traceback: {traceback.format_exc()}")
-                #     self.stats["failed"] += records_count if 'records_count' in locals() else 0
-                #     break
+            #     except Exception as e:
+            #         logger.error(f"[Batch {batch_number}] Exception: {e}")
+            #         import traceback
+            #         logger.error(f"Traceback: {traceback.format_exc()}")
+            #         self.stats["failed"] += records_count if 'records_count' in locals() else 0
+            #         break
         
-        # # Print final report
+        ## Print final report
         # self._print_final_report()
     
     def _print_final_report(self):
@@ -867,6 +954,11 @@ class SimpleMilvusToEndeeMigrator:
         logger.info(f"Total records processed: {self.checkpoint.get_processed_count()}")
         logger.info(f"Records fetched this run: {self.stats['fetched']}")
         logger.info(f"Records upserted this run: {self.stats['upserted']}")
+        
+        if self.vector_field_info and self.vector_field_info.get('is_hybrid'):
+            logger.info(f"Records with sparse vectors: {self.stats['records_with_sparse']}")
+            logger.info(f"Records without sparse vectors: {self.stats['records_without_sparse']}")
+        
         logger.info(f"Records failed: {self.stats['failed']}")
         logger.info(f"Batches processed: {self.stats['batches_processed']}")
         
@@ -880,9 +972,11 @@ class SimpleMilvusToEndeeMigrator:
         if self.vector_field_info:
             logger.info("\nField Mapping (Milvus → Endee):")
             logger.info(f"  {self.id_field_name} → id")
-            logger.info(f"  {self.vector_field_name} → vector")
+            logger.info(f"  {self.dense_vector_field_name} → vector")
+            if self.sparse_vector_field_name:
+                logger.info(f"  {self.sparse_vector_field_name} → sparse_indices + sparse_values")
             if self.vector_field_info.get('other_fields'):
-                logger.info(f"  Other fields → metadata.{{field_name}}")
+                logger.info(f"  Other fields → meta.{{field_name}}")
             logger.info("="*80)
         
         if self.interrupted:
@@ -894,14 +988,10 @@ class SimpleMilvusToEndeeMigrator:
         logger.info("="*80)
 
     def migrate(self):
-        """Wrapper Function to run the migration"""
-        if self.is_multivector:
-            raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
         asyncio.run(self.async_migrate())
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Simple sequential migration from Milvus to Endee (Dense vectors)"
+        description="Migration from Milvus to Endee (Auto-detects Hybrid or Dense)"
     )
     
     # Source arguments
@@ -911,9 +1001,8 @@ def main():
     parser.add_argument("--source_port", type=int, default=os.getenv("SOURCE_PORT"), help="Milvus port")
     parser.add_argument("--filter_fields", default=os.getenv("FILTER_FIELDS",""), help="Filter fields")
     parser.add_argument("--is_multivector", action="store_true",
-                       default=os.getenv("IS_MULTIVECTOR","false").lower() == "true",
+                       default=os.getenv("IS_MULTIVECTOR",False),
                        help="Is multivector")
-
     # Target arguments
     parser.add_argument("--target_url", default=os.getenv("TARGET_URL"), help="Endee URI")
     parser.add_argument("--target_api_key", default=os.getenv("TARGET_API_KEY"), help="Endee API key")
@@ -937,7 +1026,7 @@ def main():
     parser.add_argument("--checkpoint_file", default=os.getenv("CHECKPOINT_FILE","./migration_checkpoint.json"), 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
     parser.add_argument("--clear_checkpoint", action="store_true", 
-                       default=os.getenv("CLEAR_CHECKPOINT",False),
+                       default=os.getenv("CLEAR_CHECKPOINT","false").lower() == "true",
                        help="Clear existing checkpoint and start fresh")
     
     # Debug
@@ -950,13 +1039,14 @@ def main():
     # Set debug level if requested
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+    logger.info(f"creating migrator")
     # Create migrator
-    migrator = SimpleMilvusToEndeeMigrator(
+    migrator = HybridMilvusToEndeeMigrator(
         milvus_url=args.source_url,
         milvus_token=args.source_api_key,
         milvus_collection=args.source_collection,
         milvus_port=args.source_port,
+        filter_fields=args.filter_fields,
         endee_url=args.target_url,
         endee_api_key=args.target_api_key,
         endee_index=args.target_collection,
@@ -966,10 +1056,9 @@ def main():
         M=args.M,
         ef_construct=args.ef_construct,
         checkpoint_file=args.checkpoint_file,
-        filter_fields=args.filter_fields,
         is_multivector=args.is_multivector
     )
-    
+    logger.info(f"migrator created")
     # Clear checkpoint if requested
     if args.clear_checkpoint:
         logger.info("Clearing checkpoint for fresh start...")
