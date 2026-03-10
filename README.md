@@ -206,7 +206,6 @@ docker run \
   --env-file .env \
   -v $(pwd)/data:/app/data \
   vector-migration:latest \
-  qdrant-to-endee-hybrid   # ← change this line to switch migration type
   # qdrant-to-endee-dense
   # milvus-to-endee-hybrid
   # milvus-to-endee-dense
