@@ -479,8 +479,8 @@ class AsyncHybridMilvusToEndeeMigrator:
                         if k not in self.filter_fields and k in payload_field_names
                     }
                 else:
-                    filter_data = {k: v for k, v in record.items() if k in payload_field_names}
-                    meta_data = {}
+                    filter_data = {}
+                    meta_data = {k: v for k, v in record.items() if k in payload_field_names}
 
                 endee_record = {
                     "id": record_id,

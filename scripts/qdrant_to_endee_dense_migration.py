@@ -433,8 +433,8 @@ class SimpleQdrantToEndeeMigrator:
                 filter_data = {key: value for key, value in payload.items() if key in self.filter_fields}
                 meta_data = {key: value for key, value in payload.items() if key not in self.filter_fields}
             else:
-                filter_data = payload
-                meta_data = {}
+                filter_data = {}
+                meta_data = payload
             records.append(
                     {
                         "id": str(point.id),

@@ -522,8 +522,9 @@ class QdrantHybridToEndeeMigrator:
                     filter_data = {key: value for key, value in payload.items() if key in self.filter_fields}
                     meta_data = {key: value for key, value in payload.items() if key not in self.filter_fields}
                 else:
-                    filter_data = payload
-                    meta_data = {}
+                    filter_data = {}
+                    meta_data = payload
+
                 
                 record = {
                     "id": str(point.id),
@@ -531,6 +532,7 @@ class QdrantHybridToEndeeMigrator:
                     "meta": meta_data,
                     "filter": filter_data
                 }
+                # logger.info(f"filter_keys: {filter_data.keys()}")
                 
                 # Add sparse vector if present
                 if sparse_data:

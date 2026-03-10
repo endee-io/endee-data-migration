@@ -465,8 +465,8 @@ class SimpleMilvusToEndeeMigrator:
                 filter_data = {key: value for key, value in record.items() if key in self.filter_fields}
                 meta_data = {key: value for key, value in record.items() if key not in self.filter_fields and key in payload_field_names}
             else:
-                filter_data = {key:value for key, value in record.items() if key in payload_field_names}
-                meta_data = {}
+                filter_data = {}
+                meta_data = {key:value for key, value in record.items() if key in payload_field_names}
             endee_record = {
                 "id": record_id,
                 "vector": vector,
