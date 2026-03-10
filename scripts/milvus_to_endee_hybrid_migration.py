@@ -195,13 +195,17 @@ class AsyncHybridMilvusToEndeeMigrator:
     # ══════════════════════════════════════════════════════════════
     def connect_milvus(self):
         logger.info("Connecting to Milvus...")
-        uri = self.milvus_url
-        if not uri.startswith(("http://", "https://", "tcp://", "unix://")):
-            if uri.startswith("localhost") or uri.replace(".", "").replace(":", "").isdigit():
-                uri = f"http://{uri}:{self.milvus_port}"
-                logger.info(f"Added protocol to URI: {uri}")
-        self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
-        logger.info("✓ Connected to Milvus")
+        try:
+            uri = self.milvus_url
+            if not uri.startswith(("http://", "https://", "tcp://", "unix://")):
+                if uri.startswith("localhost") or uri.replace(".", "").replace(":", "").isdigit():
+                    uri = f"http://{uri}:{self.milvus_port}"
+                    logger.info(f"Added protocol to URI: {uri}")
+            self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
+            self.endee_client.list_indexes()
+            logger.info("✓ Connected to Milvus")
+        except Exception as e:
+            logger.error(f"Failed to connect to Milvus: {e}")
 
     def connect_endee(self):
         logger.info("Connecting to Endee...")
@@ -888,8 +892,8 @@ def main():
 
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # if args.debug:
+    #     logging.getLogger().setLevel(logging.DEBUG)
 
     migrator = AsyncHybridMilvusToEndeeMigrator(
         milvus_url=args.source_url,
@@ -920,7 +924,6 @@ def main():
         logger.warning("\nInterrupted by user. Progress has been saved.")
     except Exception as e:
         logger.error(f"Migration failed: {e}")
-        logger.error(traceback.format_exc())
         sys.exit(1)
 
 

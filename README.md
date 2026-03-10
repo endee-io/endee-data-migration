@@ -46,22 +46,18 @@ cp .env.example .env
 
 Set your source database, target Endee credentials, and migration type. See [Configuration Reference](#configuration-reference) below for all options.
 
-### 2. Build the Docker image
+### 2. Run the migration
 
-```bash
-docker build -t vector-migration:latest .
-```
-
-### 3. Run the migration
-
-Edit `cmd.sh` to select your migration type, then run:
-
+Run `cmd.sh`:
 ```bash
 bash cmd.sh
 ```
 
 Or run directly with Docker:
 
+```bash
+docker build -t vector-migration:latest .
+```
 ```bash
 docker run \
   --rm \

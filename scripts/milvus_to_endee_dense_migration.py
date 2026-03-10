@@ -198,18 +198,19 @@ class SimpleMilvusToEndeeMigrator:
     def connect_milvus(self):
         """Connect to Milvus"""
         logger.info("Connecting to Milvus...")
-        
-        # Fix URI if needed - add protocol if missing
-        uri = self.milvus_url
-        if not uri.startswith(('http://', 'https://', 'tcp://', 'unix://')):
-            # If it's localhost or an IP without protocol, add http://
-            if uri.startswith('localhost') or uri.replace('.', '').replace(':', '').isdigit():
-                uri = f"http://{uri}:{self.milvus_port}"
-                logger.info(f"Added protocol to URI: {uri}")
-        
-        self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
-        print("milvus_collections: ", self.milvus_client.list_collections())
-        logger.info("✓ Connected to Milvus")
+        try:
+            # Fix URI if needed - add protocol if missing
+            uri = self.milvus_url
+            if not uri.startswith(('http://', 'https://', 'tcp://', 'unix://')):
+                # If it's localhost or an IP without protocol, add http://
+                if uri.startswith('localhost') or uri.replace('.', '').replace(':', '').isdigit():
+                    uri = f"http://{uri}:{self.milvus_port}"
+                    logger.info(f"Added protocol to URI: {uri}")
+            
+            self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
+            logger.info("✓ Connected to Milvus")
+        except Exception as e:
+            logger.error(f"Failed to connect to Milvus: {e}")
     
     def connect_endee(self):
         """Connect to Endee"""
@@ -783,73 +784,7 @@ class SimpleMilvusToEndeeMigrator:
 
         self._print_final_report()
 
-            # while not self.interrupted:
-            #     try:
-            #         # Fetch batch from Milvus
-            #         logger.info(f"\n[Batch {batch_number}] Fetching from Milvus (offset: {offset})...")
-            #         milvus_results = self.fetch_batch(offset)
-                    
-            #         # Check if done
-            #         if not milvus_results or len(milvus_results) == 0:
-            #             logger.info("✓ No more data to fetch")
-            #             break
-                    
-            #         # Convert to Endee format
-            #         records = self.convert_records(milvus_results)
-            #         records_count = len(records)
-            #         self.stats["fetched"] += records_count
-                    
-            #         logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
-                    
-            #         # Show sample record structure (first batch only)
-            #         if batch_number == 0 and records:
-            #             logger.info(f"\nSample Endee record structure:")
-            #             sample = records[0].copy()
-            #             # Truncate vector for display
-            #             if 'vector' in sample and len(sample['vector']) > 5:
-            #                 sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
-            #             logger.info(json.dumps(sample, indent=2))
-                    
-            #         # Upsert to Endee
-            #         logger.info(f"[Batch {batch_number}] Upserting to Endee...")
-            #         success = self.upsert_records(records)
-                    
-            #         if success:
-            #             # Update offset for next batch
-            #             new_offset = offset + records_count
-                        
-            #             # Update checkpoint
-            #             self.checkpoint.update(batch_number, records_count, new_offset)
-            #             self.stats["upserted"] += records_count
-            #             self.stats["batches_processed"] += 1
-                        
-            #             # Update progress bar
-            #             pbar.update(records_count)
-                        
-            #             logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
-                        
-            #             # If we got fewer results than requested, we've reached the end
-            #             if len(milvus_results) < self.fetch_batch_size:
-            #                 logger.info(f"✓ Reached end of collection (got {len(milvus_results)} < {self.fetch_batch_size})")
-            #                 break
-                        
-            #             # Move to next batch
-            #             offset = new_offset
-            #             batch_number += 1
-            #         else:
-            #             self.stats["failed"] += records_count
-            #             logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
-            #             break
-                    
-                # except Exception as e:
-                #     logger.error(f"[Batch {batch_number}] Exception: {e}")
-                #     import traceback
-                #     logger.error(f"Traceback: {traceback.format_exc()}")
-                #     self.stats["failed"] += records_count if 'records_count' in locals() else 0
-                #     break
-        
-        # # Print final report
-        # self._print_final_report()
+           
     
     def _print_final_report(self):
         """Print migration summary"""
@@ -947,9 +882,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Set debug level if requested
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # # Set debug level if requested
+    # if args.debug:
+    #     logging.getLogger().setLevel(logging.DEBUG)
     
     # Create migrator
     migrator = SimpleMilvusToEndeeMigrator(
@@ -982,8 +917,6 @@ def main():
         logger.warning("\nInterrupted by user. Progress has been saved.")
     except Exception as e:
         logger.error(f"Migration failed with exception: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 

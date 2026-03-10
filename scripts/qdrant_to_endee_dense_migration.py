@@ -166,6 +166,7 @@ class SimpleQdrantToEndeeMigrator:
                 api_key=self.qdrant_api_key,
                 https=bool(self.use_https)
             )
+            self.qdrant_client.get_collections()
             logger.info("✓ Connected to Qdrant")
         except Exception as e:
             logger.error(f"Failed to connect to Qdrant: {e}")
@@ -641,9 +642,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Set debug level if requested
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # # Set debug level if requested
+    # if args.debug:
+    #     logging.getLogger().setLevel(logging.DEBUG)
 
     print("args.is_multivector_before: ",args.is_multivector)
     # Create migrator
@@ -676,8 +677,6 @@ def main():
         logger.warning("\nInterrupted by user. Progress has been saved.")
     except Exception as e:
         logger.error(f"Migration failed with exception: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 
