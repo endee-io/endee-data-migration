@@ -158,13 +158,17 @@ class QdrantHybridToEndeeMigrator:
     def connect_qdrant(self):
         """Connect to Qdrant"""
         logger.info("Connecting to Qdrant...")
-        self.qdrant_client = QdrantClient(
-            url=self.qdrant_url,
-            port=self.qdrant_port,
-            api_key=self.qdrant_api_key,
-            https=self.use_https
-        )
-        logger.info("✓ Connected to Qdrant")
+        try:
+            self.qdrant_client = QdrantClient(
+                url=self.qdrant_url,
+                port=self.qdrant_port,
+                api_key=self.qdrant_api_key,
+                https=bool(self.use_https)
+            )
+            self.qdrant_client.get_collections()
+            logger.info("✓ Connected to Qdrant")
+        except Exception as e:
+            logger.error(f"Failed to connect to Qdrant: {e}")
     
     def connect_endee(self):
         """Connect to Endee"""
@@ -294,6 +298,7 @@ class QdrantHybridToEndeeMigrator:
                 else:
                     self.stats["failed"] += records_count
                     logger.error(f"Batch {batch_number}: Failed To Upsert")
+                    self._stop_event.set()
                     # UNFINISHED TASKS REDUCE BY 1
                     queue.task_done()
                     break
@@ -304,6 +309,10 @@ class QdrantHybridToEndeeMigrator:
                 logger.error(f"[Consumer] Exception: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
+                print("failed consumer")
+                self._stop_event.set()
+                # UNFINISHED TASKS REDUCE BY 1
+                queue.task_done()
                 break
         
         logger.info("CONSUMER FINISHED")
@@ -447,19 +456,30 @@ class QdrantHybridToEndeeMigrator:
     
     async def async_fetch_batch(self, offset: Optional[Any]) -> tuple:
         """Fetch a single batch from Qdrant"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        logger.info(f"FETCH: submitting scroll to executor, offset={offset}")  # add this
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
+                None,
+                lambda: self._scroll_with_logging(offset)  # wrap with logging
+            ),
+            timeout=30,
+        )
+        points_batch, next_offset = result
+        return points_batch, next_offset
 
-        # HERE NONE USES DEFAULT THREAD POOL EXECUTOR
-        # SCROLL IS SYNC CALL
-        # SO WE NEED TO RUN IT IN EXECUTOR IN SEPARATE THREAD WHICH IS DONE BY RUN_IN_EXECUTOR
-        points_batch, next_offset = await loop.run_in_executor(None, lambda: self.qdrant_client.scroll(
+    def _scroll_with_logging(self, offset):
+        logger.info(f"SCROLL: thread started, offset={offset}")   # runs in executor thread
+        result = self.qdrant_client.scroll(
             collection_name=self.qdrant_collection,
             limit=self.fetch_batch_size,
             offset=offset,
             with_payload=True,
-            with_vectors=True
-        ))
-        return points_batch, next_offset
+            with_vectors=True,
+        )
+        logger.info(f"SCROLL: thread finished, got {len(result[0])} records")
+        return result
+
     
     def convert_records(self, points) -> list:
         """Convert Qdrant hybrid points to Endee format
@@ -474,6 +494,12 @@ class QdrantHybridToEndeeMigrator:
             for field in self.filter_fields:
                 if field not in payload.keys():
                     raise ValueError(f"Field {field} not found in payload")
+            if self.filter_fields:
+                sample_filter = {k: v for k, v in payload.items() if k in self.filter_fields}
+            else:
+                sample_filter = payload
+            logger.info(f"SAMPLE FILTER DATA: {sample_filter}")
+            logger.info(f"SAMPLE FILTER TYPES: { {k: type(v).__name__ for k, v in sample_filter.items()} }")
         for point in points:
             try:
                 # Extract dense and sparse vectors
@@ -582,7 +608,7 @@ class QdrantHybridToEndeeMigrator:
         self.stats["start_time"] = time.time()
         
         logger.info("="*80)
-        logger.info("ASYNC HYBRID MIGRATION")
+        logger.info("ASYNC HYBRID MIGRATION STARTED")
         logger.info("="*80)
         logger.info(f"Source: {self.qdrant_collection} @ {self.qdrant_url}:{self.qdrant_port}")
         logger.info(f"Target: {self.endee_index_name}")
@@ -631,7 +657,7 @@ class QdrantHybridToEndeeMigrator:
             await asyncio.gather(self.async_producer(queue), self.async_consumer(queue, pbar),)
         
 
-        logger.info("ASYNC MIGRATION COMPLETED")
+        logger.info("ASYNC MIGRATION EXIT")
         logger.info("="*80)
         self._print_final_report()
 
@@ -730,9 +756,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Set debug level if requested
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # # Set debug level if requested
+    # if args.debug:
+    #     logging.getLogger().setLevel(logging.DEBUG)
     
     # Create migrator
     migrator = QdrantHybridToEndeeMigrator(
@@ -764,8 +790,8 @@ def main():
         logger.warning("\nInterrupted by user. Progress has been saved.")
     except Exception as e:
         logger.error(f"Migration failed with exception: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        # import traceback
+        # logger.error(f"Traceback: {traceback.format_exc()}")
         sys.exit(1)
 
 

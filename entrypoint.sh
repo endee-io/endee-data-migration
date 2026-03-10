@@ -134,15 +134,26 @@ ${GREEN}Support:${NC}
 EOF
 }
 
-# Check if help is requested
-if [ "$1" = "--help" ] || [ "$1" = "-h" ] || [ -z "$1" ]; then
+# 1. Read migration type — CLI arg takes priority, fall back to env var
+if [ ! -z "$1" ] && [[ "$1" != --* ]]; then
+    MIGRATION_TYPE=$1
+    shift
+fi
+# MIGRATION_TYPE from .env is already available if not set above
+
+# 2. Now check help — only show if explicitly requested, not just because $1 is empty
+if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     show_help
     exit 0
 fi
 
-# Get migration type
-MIGRATION_TYPE=$1
-shift
+# 3. Validate
+if [ -z "$MIGRATION_TYPE" ]; then
+    print_error "No migration type specified."
+    echo "Set MIGRATION_TYPE in .env or pass it as an argument."
+    show_help
+    exit 1
+fi
 
 # Print banner
 echo -e "${CYAN}╔════════════════════════════════════════════════════════════════╗${NC}"

@@ -34,4 +34,4 @@ ENV PYTHONPATH=/app
 ENTRYPOINT ["/app/entrypoint.sh"]
 
 # Default command (show help)
-CMD ["--help"]
+CMD []
