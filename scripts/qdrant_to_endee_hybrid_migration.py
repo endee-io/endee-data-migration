@@ -165,7 +165,7 @@ class QdrantHybridToEndeeMigrator:
                 api_key=self.qdrant_api_key,
                 https=bool(self.use_https)
             )
-            self.qdrant_client.get_collections()
+            logger.info(self.qdrant_client.get_collections())
             logger.info("✓ Connected to Qdrant")
         except Exception as e:
             logger.error(f"Failed to connect to Qdrant: {e}")
@@ -491,6 +491,7 @@ class QdrantHybridToEndeeMigrator:
         # CHECK IF FILTER FIELDS ARE PRESENT IN THE PAYLOAD
         if points:
             payload = points[0].payload
+            logger.info(f"SAMPLE PAYLOAD: {payload.keys()}")
             for field in self.filter_fields:
                 if field not in payload.keys():
                     raise ValueError(f"Field {field} not found in payload")

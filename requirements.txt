@@ -4,7 +4,8 @@ cachetools==7.0.0
 certifi==2026.1.4
 charset-normalizer==3.4.4
 dotenv==0.9.9
-endee==0.1.8
+# endee==0.1.8
+# /Users/omnishkumar/Desktop/endee_python_client/endee-python-client/dist/endee-0.1.19-py3-none-any.whl
 exceptiongroup==1.3.1
 grpcio==1.76.0
 h11==0.16.0
