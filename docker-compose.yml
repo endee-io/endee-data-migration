@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  migration:
+    image: vector-migration:latest
+    env_file: .env.dev
+    volumes:
+      - ./data:/app/data
+    networks:
+      - vector-net
+
+networks:
+  vector-net:
