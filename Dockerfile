@@ -12,10 +12,12 @@ RUN apt-get update && apt-get install -y \
 
 # Copy requirements file
 COPY requirements.txt .
-COPY endee-0.1.19-py3-none-any.whl .
 
-# Install Python dependencies'
-RUN pip install --no-cache-dir -r requirements.txt endee-0.1.19-py3-none-any.whl
+RUN pip install --no-cache-dir -r requirements.txt
+# COPY endee-0.1.19-py3-none-any.whl .
+
+# # Install Python dependencies'
+# RUN pip install --no-cache-dir -r requirements.txt endee-0.1.19-py3-none-any.whl
 
 # Copy migration scripts
 COPY scripts/ /app/scripts/
