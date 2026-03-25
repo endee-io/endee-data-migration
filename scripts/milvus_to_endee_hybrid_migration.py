@@ -395,7 +395,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                     name=self.endee_index_name,
                     dimension=self.vectors_dimension,
                     space_type=self.space_type,
-                    sparse_dim=self.sparse_dimension,
+                    sparse_model="default",
                     M=self.M,
                     ef_con=self.ef_construct,
                     precision=self.precision,

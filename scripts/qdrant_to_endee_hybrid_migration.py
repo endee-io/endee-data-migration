@@ -446,7 +446,7 @@ class QdrantHybridToEndeeMigrator:
                 name=self.endee_index_name,
                 dimension=config["dimension"],
                 space_type=config["space_type"],
-                sparse_dim=config["sparse_dimension"],
+                sparse_model="default",
                 M=config["M"],
                 ef_con=config["ef_construct"],
                 precision=config["precision"]
