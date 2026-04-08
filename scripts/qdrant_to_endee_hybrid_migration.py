@@ -733,7 +733,7 @@ def main():
     parser.add_argument("--checkpoint_file", default=os.getenv("CHECKPOINT_FILE","./migration_checkpoint.json"), 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
     parser.add_argument("--clear_checkpoint", action="store_true", 
-                       default=os.getenv("CLEAR_CHECKPOINT",False),
+                       default=os.getenv("CLEAR_CHECKPOINT",'false').lower()=="true",
                        help="Clear existing checkpoint and start fresh")
 
     parser.add_argument(
