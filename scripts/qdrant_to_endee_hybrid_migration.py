@@ -1,3 +1,5 @@
+from constants import DEFAULT_MAX_QUEUE_SIZE
+from constants import DEFAULT_BATCH_NUMBER
 from typing import Dict, Any, Optional
 from qdrant_client import QdrantClient
 from endee import Endee, Precision
@@ -13,6 +15,7 @@ import urllib
 import os
 import dotenv
 import asyncio
+from constants import *
 
 dotenv.load_dotenv()
 
@@ -27,31 +30,30 @@ logger = logging.getLogger(__name__)
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
     
-    def __init__(self, checkpoint_file: str = "./migration_checkpoint.json"):
+    def __init__(self, checkpoint_file: str = CHECKPOINT_FILE):
         self.checkpoint_file = checkpoint_file
         self.data = self._load()
     
     def _load(self) -> Dict[str, Any]:
         """Load checkpoint from file"""
+
+        exception_resposne = {
+                PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
+                LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
+                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+            }
+
         try:
             with open(self.checkpoint_file, 'r') as f:
                 data = orjson.loads(f.read())
-                logger.info(f"✓ Loaded checkpoint: {data.get('processed_count', 0)} records processed")
+                logger.info(f"✓ Loaded checkpoint: {data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)} records processed")
                 return data
         except FileNotFoundError:
             logger.info("No checkpoint found, starting fresh migration")
-            return {
-                "processed_count": 0,
-                "last_offset": None,
-                "batch_number": 0
-            }
+            return exception_resposne
         except Exception as e:
             logger.warning(f"Could not load checkpoint: {e}, starting fresh")
-            return {
-                "processed_count": 0,
-                "last_offset": None,
-                "batch_number": 0
-            }
+            return exception_resposne
     
     def save(self):
         """Save checkpoint to file"""
@@ -63,30 +65,30 @@ class MigrationCheckpoint:
     
     def update(self, batch_number: int, records_count: int, offset: Optional[Any] = None):
         """Update checkpoint after successful batch"""
-        self.data["processed_count"] += records_count
-        self.data["batch_number"] = batch_number
+        self.data[PROCESSED_COUNT_KEY] += records_count
+        self.data[BATCH_NUMBER_KEY] = batch_number
         if offset is not None:
-            self.data["last_offset"] = offset
+            self.data[LAST_OFFSET_KEY] = offset
         self.save()
     
     def get_last_offset(self):
         """Get the last processed offset"""
-        return self.data.get("last_offset")
+        return self.data.get(LAST_OFFSET_KEY)
     
     def get_batch_number(self) -> int:
         """Get the last processed batch number"""
-        return self.data.get("batch_number", 0)
+        return self.data.get(BATCH_NUMBER_KEY, DEFAULT_BATCH_NUMBER)
     
     def get_processed_count(self) -> int:
         """Get total processed records"""
-        return self.data.get("processed_count", 0)
+        return self.data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)
     
     def clear(self):
         """Clear checkpoint for fresh start"""
         self.data = {
-            "processed_count": 0,
-            "last_offset": None,
-            "batch_number": 0
+            PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
+            LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
+            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
         }
         self.save()
 
@@ -103,14 +105,13 @@ class QdrantHybridToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
-        max_queue_size: int = 5,
-        fetch_batch_size: int = 1000,
-        upsert_batch_size: int = 1000,
+        fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
+        upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
         use_https: bool = False,
-        checkpoint_file: str = "./migration_checkpoint.json",
+        checkpoint_file: str = CHECKPOINT_FILE,
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
         filter_fields: str = "",
         is_multivector: bool = False
-
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
@@ -134,11 +135,11 @@ class QdrantHybridToEndeeMigrator:
         self._stop_event = None
         # Statistics
         self.stats = {
-            "fetched": 0,
-            "upserted": 0,
-            "failed": 0,
-            "batches_processed": 0,
-            "start_time": None
+            FETCHED_KEY: 0,
+            UPSERTED_KEY: 0,
+            FAILED_KEY: 0,
+            BATCHES_PROCESSED_KEY: 0,
+            START_TIME_KEY: None
         }
         
         # Setup signal handler for graceful shutdown
@@ -180,7 +181,7 @@ class QdrantHybridToEndeeMigrator:
         # # Set custom base URL if provided
         logger.info(f"Endee URL: {self.endee_url}")
         if self.endee_url:
-            url = urllib.parse.urljoin(self.endee_url, "/api/v1")
+            url = urllib.parse.urljoin(self.endee_url, ENDEE_V1_API)
             self.endee_client.set_base_url(url)
             logger.info(f"Set Endee base URL: {url}")
 
@@ -422,17 +423,17 @@ class QdrantHybridToEndeeMigrator:
         
         
         config = {
-            "dimension": vectors_dimension,
-            "space_type": endee_space_type,
-            "sparse_dimension": sparse_dimension,
-            "M": M,
-            "ef_construct": ef_construct,
-            "precision": endee_precision
+            DIMENSION_KEY: vectors_dimension,
+            SPACE_TYPE_KEY: endee_space_type,
+            SPARSE_DIMENSION_KEY: sparse_dimension,
+            M_KEY: M,
+            EF_CONSTRUCT_KEY: ef_construct,
+            PRECISION_KEY: endee_precision
         }
         
-        logger.info(f"✓ Collection config: dim={config['dimension']}, "
-                   f"space={config['space_type']}, sparse_dim={config['sparse_dimension']}, "
-                   f"M={config['M']}, ef={config['ef_construct']}")
+        logger.info(f"✓ Collection config: dim={config[DIMENSION_KEY]}, "
+                   f"space={config[SPACE_TYPE_KEY]}, sparse_dim={config[SPARSE_DIMENSION_KEY]}, "
+                   f"M={config[M_KEY]}, ef={config[EF_CONSTRUCT_KEY]}")
         return config
     
     def get_or_create_endee_index(self, config: Dict[str, Any]):
@@ -444,12 +445,11 @@ class QdrantHybridToEndeeMigrator:
             logger.info(f"Creating hybrid index: {self.endee_index_name}")
             self.endee_client.create_index(
                 name=self.endee_index_name,
-                dimension=config["dimension"],
-                space_type=config["space_type"],
-                sparse_model="default",
-                M=config["M"],
-                ef_con=config["ef_construct"],
-                precision=config["precision"]
+                dimension=config[DIMENSION_KEY],
+                sparse_model=DEFAULT_SPARSE_MODEL,
+                M=config[M_KEY],
+                ef_con=config[EF_CONSTRUCT_KEY],
+                precision=config[PRECISION_KEY]
             )
             self.endee_index = self.endee_client.get_index(self.endee_index_name)
             logger.info(f"✓ Created hybrid index: {self.endee_index_name}")
@@ -528,17 +528,16 @@ class QdrantHybridToEndeeMigrator:
 
                 
                 record = {
-                    "id": str(point.id),
-                    "vector": dense_vector,
-                    "meta": meta_data,
-                    "filter": filter_data
+                    ENDEE_ID_KEY: str(point.id),
+                    ENDEE_VECTOR_KEY: dense_vector,
+                    ENDEE_FILTER_KEY: filter_data,
+                    ENDEE_META_KEY: point.payload
                 }
-                # logger.info(f"filter_keys: {filter_data.keys()}")
-                
+
                 # Add sparse vector if present
                 if sparse_data:
-                    record["sparse_indices"] = sparse_data.indices
-                    record["sparse_values"] = sparse_data.values
+                    record[ENDEE_SPARSE_INDICES_KEY] = sparse_data.indices
+                    record[ENDEE_SPARSE_VALUES_KEY] = sparse_data.values
                 
                 records.append(record)
                 
@@ -666,32 +665,32 @@ class QdrantHybridToEndeeMigrator:
 
     def _print_final_report(self):
         """Print migration summary"""
-        duration = time.time() - self.stats["start_time"]
+        duration = time.time() - self.stats[START_TIME_KEY]
         
         logger.info("\n" + "="*80)
         if self.interrupted:
             logger.warning("MIGRATION INTERRUPTED")
-        elif self.stats["failed"] > 0:
+        elif self.stats[FAILED_KEY] > 0:
             logger.warning("MIGRATION COMPLETED WITH ERRORS")
         else:
             logger.info("MIGRATION COMPLETED SUCCESSFULLY")
         logger.info("="*80)
         logger.info(f"Duration: {duration:.2f} seconds ({duration/60:.2f} minutes)")
         logger.info(f"Total records processed: {self.checkpoint.get_processed_count()}")
-        logger.info(f"Records fetched this run: {self.stats['fetched']}")
-        logger.info(f"Records upserted this run: {self.stats['upserted']}")
-        logger.info(f"Records failed: {self.stats['failed']}")
-        logger.info(f"Batches processed: {self.stats['batches_processed']}")
+        logger.info(f"Records fetched this run: {self.stats[FETCHED_KEY]}")
+        logger.info(f"Records upserted this run: {self.stats[UPSERTED_KEY]}")
+        logger.info(f"Records failed: {self.stats[FAILED_KEY]}")
+        logger.info(f"Batches processed: {self.stats[BATCHES_PROCESSED_KEY]}")
         
-        if self.stats['upserted'] > 0:
-            rate = self.stats['upserted'] / duration
+        if self.stats[UPSERTED_KEY] > 0:
+            rate = self.stats[UPSERTED_KEY] / duration
             logger.info(f"Throughput: {rate:.2f} records/second")
-        
+
         logger.info("="*80)
-        
+
         if self.interrupted:
             logger.info("Progress saved. Run again to resume from checkpoint.")
-        elif self.stats['failed'] > 0:
+        elif self.stats[FAILED_KEY] > 0:
             logger.warning("Migration had errors. Check logs and retry.")
         else:
             logger.info("Migration successful!")
@@ -721,16 +720,16 @@ def main():
     parser.add_argument("--target_collection", default=os.getenv("TARGET_COLLECTION"), help="Endee index name")
     
     # Performance arguments
-    parser.add_argument("--batch_size", type=int, default=os.getenv("BATCH_SIZE",1000), 
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_FETCH_BATCH_SIZE, 
                        help="Fetch batch size (default: 1000)")
-    parser.add_argument("--upsert_size", type=int, default=os.getenv("UPSERT_SIZE",1000), 
+    parser.add_argument("--upsert_size", type=int, default=DEFAULT_UPSERT_BATCH_SIZE, 
                        help="Upsert batch size (default: 1000)")
     
     # Connection arguments
 
     
     # Resume arguments
-    parser.add_argument("--checkpoint_file", default=os.getenv("CHECKPOINT_FILE","./migration_checkpoint.json"), 
+    parser.add_argument("--checkpoint_file", default=CHECKPOINT_FILE, 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
     parser.add_argument("--clear_checkpoint", action="store_true", 
                        default=os.getenv("CLEAR_CHECKPOINT",'false').lower()=="true",
