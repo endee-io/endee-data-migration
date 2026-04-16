@@ -10,6 +10,7 @@ import time
 import signal
 import sys
 import urllib
+from constants import *
 
 # Configure logging
 logging.basicConfig(
@@ -22,32 +23,31 @@ logger = logging.getLogger(__name__)
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
     
-    def __init__(self, checkpoint_file: str = "./migration_checkpoint.json", use_https: bool = False):
+    def __init__(self, checkpoint_file: str = CHECKPOINT_FILE, use_https: bool = False):
         self.checkpoint_file = checkpoint_file
         self.use_https = use_https
         self.data = self._load()
     
     def _load(self) -> Dict[str, Any]:
         """Load checkpoint from file"""
+
+        exception_resposne = {
+                PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
+                LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
+                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+            }
+
         try:
             with open(self.checkpoint_file, 'r') as f:
                 data = orjson.load(f)
-                logger.info(f"✓ Loaded checkpoint: {data.get('processed_count', 0)} records processed")
+                logger.info(f"✓ Loaded checkpoint: {data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)} records processed")
                 return data
         except FileNotFoundError:
             logger.info("No checkpoint found, starting fresh migration")
-            return {
-                "processed_count": 0,
-                "last_offset": None,
-                "batch_number": 0
-            }
+            return exception_resposne
         except Exception as e:
             logger.warning(f"Could not load checkpoint: {e}, starting fresh")
-            return {
-                "processed_count": 0,
-                "last_offset": None,
-                "batch_number": 0
-            }
+            return exception_resposne
     
     def save(self):
         """Save checkpoint to file"""
@@ -59,30 +59,30 @@ class MigrationCheckpoint:
     
     def update(self, batch_number: int, records_count: int, offset: Optional[Any] = None):
         """Update checkpoint after successful batch"""
-        self.data["processed_count"] += records_count
-        self.data["batch_number"] = batch_number
+        self.data[PROCESSED_COUNT_KEY] += records_count
+        self.data[BATCH_NUMBER_KEY] = batch_number
         if offset is not None:
-            self.data["last_offset"] = offset
+            self.data[LAST_OFFSET_KEY] = offset
         self.save()
     
     def get_last_offset(self):
         """Get the last processed offset"""
-        return self.data.get("last_offset")
+        return self.data.get(LAST_OFFSET_KEY)
     
     def get_batch_number(self) -> int:
         """Get the last processed batch number"""
-        return self.data.get("batch_number", 0)
+        return self.data.get(BATCH_NUMBER_KEY, DEFAULT_BATCH_NUMBER)
     
     def get_processed_count(self) -> int:
         """Get total processed records"""
-        return self.data.get("processed_count", 0)
+        return self.data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)
     
     def clear(self):
         """Clear checkpoint for fresh start"""
         self.data = {
-            "processed_count": 0,
-            "last_offset": None,
-            "batch_number": 0
+            PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
+            LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
+            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
         }
         self.save()
 
@@ -98,9 +98,9 @@ class SimpleQdrantToEndeeMigrator:
         qdrant_collection: str,
         endee_api_key: str,
         endee_index: str,
-        fetch_batch_size: int = 1000,
-        upsert_batch_size: int = 1000,
-        checkpoint_file: str = "./migration_checkpoint.json",
+        fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
+        upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
+        checkpoint_file: str = CHECKPOINT_FILE,
         use_https: bool = False
     ):
         self.qdrant_url = qdrant_url
@@ -116,20 +116,18 @@ class SimpleQdrantToEndeeMigrator:
         self.checkpoint = MigrationCheckpoint(checkpoint_file, use_https)
         self.interrupted = False
 
-        
         # Clients
         self.qdrant_client = None
         self.endee_client = None
         self.endee_index = None
 
-        
         # Statistics
         self.stats = {
-            "fetched": 0,
-            "upserted": 0,
-            "failed": 0,
-            "batches_processed": 0,
-            "start_time": None
+            FETCHED_KEY: 0,
+            UPSERTED_KEY: 0,
+            FAILED_KEY: 0,
+            BATCHES_PROCESSED_KEY: 0,
+            START_TIME_KEY: None
         }
         
         # Setup signal handler for graceful shutdown
@@ -164,7 +162,7 @@ class SimpleQdrantToEndeeMigrator:
         
         # # Set custom base URL if provided
         if self.endee_url:
-            url = urllib.parse.urljoin(self.endee_url, "/api/v1")
+            url = urllib.parse.urljoin(self.endee_url, ENDEE_V1_API)
             self.endee_client.set_base_url(url)
             logger.info(f"Set Endee base URL: {url}")
 
@@ -185,8 +183,8 @@ class SimpleQdrantToEndeeMigrator:
         else:
             vectors_map = {}
         
-        vectors_dimension = 768
-        space_type = "cosine"
+        vectors_dimension = DEFAULT_VECTOR_DIMENSION
+        space_type = DEFAULT_SPACE_TYPE
         
         for _, config in vectors_map.items():
             vectors_dimension = config.size
@@ -197,15 +195,15 @@ class SimpleQdrantToEndeeMigrator:
         ef_construct = collection_info.config.hnsw_config.ef_construct
         
         config = {
-            "dimension": vectors_dimension,
-            "space_type": space_type,
-            "M": M,
-            "ef_construct": ef_construct,
-            "precision": Precision.FLOAT16
+            DIMENSION_KEY: vectors_dimension,
+            SPACE_TYPE_KEY: space_type,
+            M_KEY: M,
+            EF_CONSTRUCT_KEY: ef_construct,
+            PRECISION_KEY: Precision.FLOAT16
         }
         
-        logger.info(f"✓ Collection config: dim={config['dimension']}, "
-                   f"space={config['space_type']}, M={config['M']}, ef={config['ef_construct']}")
+        logger.info(f"✓ Collection config: dim={config[DIMENSION_KEY]}, "
+                   f"space={config[SPACE_TYPE_KEY]}, M={config[M_KEY]}, ef={config[EF_CONSTRUCT_KEY]}")
         return config
     
     def get_or_create_endee_index(self, config: Dict[str, Any]):
@@ -217,11 +215,11 @@ class SimpleQdrantToEndeeMigrator:
             logger.info(f"Creating index: {self.endee_index_name}")
             self.endee_client.create_index(
                 name=self.endee_index_name,
-                dimension=config["dimension"],
-                space_type=config["space_type"],
-                M=config["M"],
-                ef_con=config["ef_construct"],
-                precision=config["precision"]
+                dimension=config[DIMENSION_KEY],
+                space_type=config[SPACE_TYPE_KEY],
+                M=config[M_KEY],
+                ef_con=config[EF_CONSTRUCT_KEY],
+                precision=config[PRECISION_KEY]
             )
             self.endee_index = self.endee_client.get_index(self.endee_index_name)
             logger.info(f"✓ Created index: {self.endee_index_name}")
@@ -241,9 +239,9 @@ class SimpleQdrantToEndeeMigrator:
         """Convert Qdrant points to Endee format"""
         return [
             {
-                "id": str(point.id),
-                "vector": point.vector,
-                "meta": point.payload
+                ENDEE_ID_KEY: str(point.id),
+                ENDEE_VECTOR_KEY: point.vector,
+                ENDEE_META_KEY: point.payload
             }
             for point in points
         ]
@@ -272,7 +270,7 @@ class SimpleQdrantToEndeeMigrator:
     
     def migrate(self):
         """Main migration function - simple sequential processing"""
-        self.stats["start_time"] = time.time()
+        self.stats[START_TIME_KEY] = time.time()
         
         logger.info("="*80)
         logger.info("SIMPLE SEQUENTIAL MIGRATION")
@@ -327,7 +325,7 @@ class SimpleQdrantToEndeeMigrator:
                     # Convert to Endee format
                     records = self.convert_records(points_batch)
                     records_count = len(records)
-                    self.stats["fetched"] += records_count
+                    self.stats[FETCHED_KEY] += records_count
                     
                     logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
                     
@@ -338,15 +336,15 @@ class SimpleQdrantToEndeeMigrator:
                     if success:
                         # Update checkpoint
                         self.checkpoint.update(batch_number, records_count, next_offset)
-                        self.stats["upserted"] += records_count
-                        self.stats["batches_processed"] += 1
+                        self.stats[UPSERTED_KEY] += records_count
+                        self.stats[BATCHES_PROCESSED_KEY] += 1
                         
                         # Update progress bar
                         pbar.update(records_count)
                         
                         logger.info(f"[Batch {batch_number}] ✓ Successfully upserted {records_count} records")
                     else:
-                        self.stats["failed"] += records_count
+                        self.stats[FAILED_KEY] += records_count
                         logger.error(f"[Batch {batch_number}] ✗ Failed to upsert")
                         break
                     
@@ -363,7 +361,7 @@ class SimpleQdrantToEndeeMigrator:
                     logger.error(f"[Batch {batch_number}] Exception: {e}")
                     import traceback
                     logger.error(f"Traceback: {traceback.format_exc()}")
-                    self.stats["failed"] += records_count if 'records_count' in locals() else 0
+                    self.stats[FAILED_KEY] += records_count if 'records_count' in locals() else 0
                     break
         
         # Print final report
@@ -371,32 +369,32 @@ class SimpleQdrantToEndeeMigrator:
     
     def _print_final_report(self):
         """Print migration summary"""
-        duration = time.time() - self.stats["start_time"]
+        duration = time.time() - self.stats[START_TIME_KEY]
         
         logger.info("\n" + "="*80)
         if self.interrupted:
             logger.warning("MIGRATION INTERRUPTED")
-        elif self.stats["failed"] > 0:
+        elif self.stats[FAILED_KEY] > 0:
             logger.warning("MIGRATION COMPLETED WITH ERRORS")
         else:
             logger.info("MIGRATION COMPLETED SUCCESSFULLY")
         logger.info("="*80)
         logger.info(f"Duration: {duration:.2f} seconds ({duration/60:.2f} minutes)")
         logger.info(f"Total records processed: {self.checkpoint.get_processed_count()}")
-        logger.info(f"Records fetched this run: {self.stats['fetched']}")
-        logger.info(f"Records upserted this run: {self.stats['upserted']}")
-        logger.info(f"Records failed: {self.stats['failed']}")
-        logger.info(f"Batches processed: {self.stats['batches_processed']}")
+        logger.info(f"Records fetched this run: {self.stats[FETCHED_KEY]}")
+        logger.info(f"Records upserted this run: {self.stats[UPSERTED_KEY]}")
+        logger.info(f"Records failed: {self.stats[FAILED_KEY]}")
+        logger.info(f"Batches processed: {self.stats[BATCHES_PROCESSED_KEY]}")
         
-        if self.stats['upserted'] > 0:
-            rate = self.stats['upserted'] / duration
+        if self.stats[UPSERTED_KEY] > 0:
+            rate = self.stats[UPSERTED_KEY] / duration
             logger.info(f"Throughput: {rate:.2f} records/second")
-        
+
         logger.info("="*80)
-        
+
         if self.interrupted:
             logger.info("Progress saved. Run again to resume from checkpoint.")
-        elif self.stats['failed'] > 0:
+        elif self.stats[FAILED_KEY] > 0:
             logger.warning("Migration had errors. Check logs and retry.")
         else:
             logger.info("Migration successful!")
@@ -419,13 +417,13 @@ def main():
     parser.add_argument("--target_collection", required=True, help="Endee index name")
     
     # Performance arguments
-    parser.add_argument("--batch_size", type=int, default=1000, 
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_FETCH_BATCH_SIZE, 
                        help="Fetch batch size (default: 1000)")
-    parser.add_argument("--upsert_size", type=int, default=1000, 
+    parser.add_argument("--upsert_size", type=int, default=DEFAULT_UPSERT_BATCH_SIZE, 
                        help="Upsert batch size (default: 1000)")
     
     # Resume arguments
-    parser.add_argument("--checkpoint_file", default="./migration_checkpoint.json", 
+    parser.add_argument("--checkpoint_file", default=CHECKPOINT_FILE, 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
     parser.add_argument("--clear_checkpoint", action="store_true", 
                        help="Clear existing checkpoint and start fresh")
