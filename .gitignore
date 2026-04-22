@@ -7,4 +7,5 @@ data/
 .env
 
 .env.dev
+.env*
 *.whl
