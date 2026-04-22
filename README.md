@@ -53,21 +53,6 @@ Run `cmd.sh`:
 bash cmd.sh
 ```
 
-Or run directly with Docker:
-
-```bash
-docker build -t vector-migration:latest .
-```
-```bash
-docker run \
-  --rm \
-  --network vector-net \
-  --env-file .env \
-  -v $(pwd)/data:/app/data \
-  vector-migration:latest \
-  qdrant-to-endee-hybrid
-```
-
 ---
 
 ## Configuration Reference
@@ -163,10 +148,10 @@ DEBUG=false    # Set true for verbose logging
 MIGRATION_TYPE=qdrant-to-endee-hybrid
 
 # ── Source (Qdrant) ──────────────────────────────────────────────
-SOURCE_URL=http://35.207.217.185
+SOURCE_URL=
 SOURCE_PORT=6333
 SOURCE_API_KEY=
-SOURCE_COLLECTION=my_hybrid_collection
+SOURCE_COLLECTION=
 USE_HTTPS=false
 
 # ── Target (Endee) ───────────────────────────────────────────────
@@ -194,17 +179,9 @@ DEBUG=false
 
 ```bash
 #!/bin/bash
+docker network create vector-net 2>/dev/null || true
 docker build -t vector-migration:latest .
-
-docker run \
-  --rm \
-  --network vector-net \
-  --env-file .env \
-  -v $(pwd)/data:/app/data \
-  vector-migration:latest \
-  # qdrant-to-endee-dense
-  # milvus-to-endee-hybrid
-  # milvus-to-endee-dense
+docker compose up --build
 ```
 
 ---
