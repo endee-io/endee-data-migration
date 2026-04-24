@@ -504,7 +504,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                     ENDEE_ID_KEY: record_id,
                     ENDEE_VECTOR_KEY: dense_vector,
                     ENDEE_FILTER_KEY: filter_data,
-                    ENDEE_META_KEY: {}  # All other fields go here
+                    ENDEE_META_KEY: meta_data
                 }
 
                 # Sparse vector handling

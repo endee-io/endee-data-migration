@@ -528,7 +528,7 @@ class QdrantHybridToEndeeMigrator:
                     ENDEE_ID_KEY: str(point.id),
                     ENDEE_VECTOR_KEY: dense_vector,
                     ENDEE_FILTER_KEY: filter_data,
-                    ENDEE_META_KEY: point.payload
+                    ENDEE_META_KEY: meta_data
                 }
 
                 # Add sparse vector if present
