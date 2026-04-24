@@ -1,5 +1,3 @@
-from constants import DEFAULT_MAX_QUEUE_SIZE
-from constants import DEFAULT_BATCH_NUMBER
 from typing import Dict, Any, Optional
 from qdrant_client import QdrantClient
 from endee import Endee, Precision
@@ -213,7 +211,7 @@ class QdrantHybridToEndeeMigrator:
                 records = self.convert_records(points_batch)
 
                 # UPDATE STATS
-                self.stats["fetched"] += len(records)
+                self.stats[FETCHED_KEY] += len(records)
 
                 # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
                 if self.interrupted:
@@ -289,15 +287,15 @@ class QdrantHybridToEndeeMigrator:
                     self.checkpoint.update(batch_number, records_count, next_offset)
 
                     # UPDATE STATS
-                    self.stats["upserted"] += records_count
-                    self.stats["batches_processed"]+=1
+                    self.stats[UPSERTED_KEY] += records_count
+                    self.stats[BATCHES_PROCESSED_KEY] += 1
                     pbar.update(records_count)
                     upsert_time = end_time - start_time
                     throughput = records_count / upsert_time
                     logger.info(f"CONSUMER: SUCCESSFULLY UPSERTED {records_count} RECORDS IN {upsert_time:.2f} seconds WITH THROUGHPUT {throughput:.2f} records/second")
                     
                 else:
-                    self.stats["failed"] += records_count
+                    self.stats[FAILED_KEY] += records_count
                     logger.error(f"Batch {batch_number}: Failed To Upsert")
                     self._stop_event.set()
                     # UNFINISHED TASKS REDUCE BY 1
@@ -310,7 +308,6 @@ class QdrantHybridToEndeeMigrator:
                 logger.error(f"[Consumer] Exception: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-                print("failed consumer")
                 self._stop_event.set()
                 # UNFINISHED TASKS REDUCE BY 1
                 queue.task_done()
@@ -348,7 +345,7 @@ class QdrantHybridToEndeeMigrator:
             endee_space_type = "ip"
         else:
             raise ValueError(f"Invalid space type: {qdrant_space_type}")
-        sparse_dimension = 30522  # Default sparse dimension
+        sparse_dimension = DEFAULT_SPARSE_DIMENSION
         # =========================================================================================
 
         # AUTO DETECT DENSE FIELD 
@@ -607,8 +604,8 @@ class QdrantHybridToEndeeMigrator:
             3. If queue is full, producer WAITS (no memory overflow!)
             4. If queue is empty, consumer WAITS (no busy waiting!)
         """
-        self.stats["start_time"] = time.time()
-        
+        self.stats[START_TIME_KEY] = time.time()
+
         logger.info("="*80)
         logger.info("ASYNC HYBRID MIGRATION STARTED")
         logger.info("="*80)

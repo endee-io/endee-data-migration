@@ -371,7 +371,6 @@ class SimpleMilvusToEndeeMigrator:
             'other_fields_meta': other_fields
         }
 
-        print("vector_field_info: ", self.vector_field_info)
         if not self.id_field_name:
             raise ValueError("No primary key field found in collection")
         if not self.vector_field_name:
@@ -468,10 +467,10 @@ class SimpleMilvusToEndeeMigrator:
                 filter_data = {}
                 meta_data = {key:value for key, value in record.items() if key in payload_field_names}
             endee_record = {
-                "id": record_id,
-                "vector": vector,
-                "filter": filter_data,
-                "meta": meta_data
+                ENDEE_ID_KEY: record_id,
+                ENDEE_VECTOR_KEY: vector,
+                ENDEE_FILTER_KEY: filter_data,
+                ENDEE_META_KEY: meta_data
             }
 
             records.append(endee_record)
@@ -596,7 +595,7 @@ class SimpleMilvusToEndeeMigrator:
                 
                 # UPDATE STATS
                 records_count = len(records)
-                self.stats["fetched"] += records_count
+                self.stats[FETCHED_KEY] += records_count
                 logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
 
                 # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
@@ -693,8 +692,8 @@ class SimpleMilvusToEndeeMigrator:
                 # advance the offset and those records would never be
                 # retried — silent data loss.
                 self.checkpoint.update(batch_number, records_count, next_offset)
-                self.stats["upserted"] += records_count
-                self.stats["batches_processed"] += 1
+                self.stats[UPSERTED_KEY] += records_count
+                self.stats[BATCHES_PROCESSED_KEY] += 1
                 pbar.update(records_count)
                 queue.task_done()  # unblock producer
                 logger.info(
@@ -702,7 +701,7 @@ class SimpleMilvusToEndeeMigrator:
                 )
             else:
                 # ── Failure path — ORDER MATTERS ───────────────────
-                self.stats["failed"] += records_count
+                self.stats[FAILED_KEY] += records_count
                 logger.error(
                     f"[Batch {batch_number}] ✗ Failed after retries — stopping migration"
                 )
@@ -723,7 +722,7 @@ class SimpleMilvusToEndeeMigrator:
             3. If queue is full, producer WAITS (no memory overflow!)
             4. If queue is empty, consumer WAITS (no busy waiting!)
         """
-        self.stats["start_time"] = time.time()
+        self.stats[START_TIME_KEY] = time.time()
         if self.is_multivector:
             raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
         

@@ -261,7 +261,7 @@ class AsyncHybridMilvusToEndeeMigrator:
             return sparse_dim
         except Exception as e:
             logger.warning(f"Could not detect sparse dimension: {e}. Using default 30000.")
-            return 30000
+            return DEFAULT_SPARSE_DIMENSION_FALLBACK
 
     def decode_vector(self, raw_vector, field_type) -> List[float]:
         """Decode Milvus vector bytes to float list."""
@@ -413,7 +413,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                     name=self.endee_index_name,
                     dimension=self.vectors_dimension,
                     space_type=self.space_type,
-                    sparse_model="default",
+                    sparse_model=DEFAULT_SPARSE_MODEL,
                     M=self.M,
                     ef_con=self.ef_construct,
                     precision=self.precision,
@@ -521,7 +521,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                         else:
                             self.stats[RECORDS_WITHOUT_SPARSE_KEY] += 1
                     else:
-                        self.stats["records_without_sparse"] += 1
+                        self.stats[RECORDS_WITHOUT_SPARSE_KEY] += 1
                 records.append(endee_record)
 
             except Exception as e:
@@ -634,7 +634,7 @@ class AsyncHybridMilvusToEndeeMigrator:
 
                 # Convert
                 records = self.convert_records(milvus_records)
-                self.stats["fetched"] += len(records)
+                self.stats[FETCHED_KEY] += len(records)
 
                 # Interrupt check (Ctrl+C arrived during fetch)
                 if self.interrupted:
@@ -721,8 +721,8 @@ class AsyncHybridMilvusToEndeeMigrator:
 
                 if success:
                     self.checkpoint.update(batch_number, records_count, next_offset)
-                    self.stats["upserted"] += records_count
-                    self.stats["batches_processed"] += 1
+                    self.stats[UPSERTED_KEY] += records_count
+                    self.stats[BATCHES_PROCESSED_KEY] += 1
                     pbar.update(records_count)
                     throughput = records_count / elapsed if elapsed > 0 else 0
                     logger.info(
@@ -732,7 +732,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                     )
                     queue.task_done()
                 else:
-                    self.stats["failed"] += records_count
+                    self.stats[FAILED_KEY] += records_count
                     logger.error(f"CONSUMER: batch {batch_number} ✗ — failed after retries")
                     self._stop_event.set()   # 1. signal producer   ← BUG 3 fix
                     queue.task_done()        # 2. unblock producer
@@ -807,7 +807,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                 "Multivector mode is not supported for Milvus → Endee hybrid migration"
             )
 
-        self.stats["start_time"] = time.time()
+        self.stats[START_TIME_KEY] = time.time()
 
         # ── Sync setup BEFORE event loop ───────────────────────────
         self.connect_milvus()

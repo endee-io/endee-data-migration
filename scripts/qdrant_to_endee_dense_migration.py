@@ -124,7 +124,6 @@ class SimpleQdrantToEndeeMigrator:
         self.endee_index_name = endee_index
         self.fetch_batch_size = fetch_batch_size
         self.upsert_batch_size = upsert_batch_size
-        print(f"use_https: {use_https}")
         self.use_https = use_https
         self.checkpoint = MigrationCheckpoint(checkpoint_file, use_https)
         self.interrupted = False
@@ -214,7 +213,7 @@ class SimpleQdrantToEndeeMigrator:
                 records = self.convert_records(points_batch)
 
                 # UPDATE STATS
-                self.stats["fetched"] += len(records)
+                self.stats[FETCHED_KEY] += len(records)
 
                 # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
                 if self.interrupted:
@@ -290,14 +289,14 @@ class SimpleQdrantToEndeeMigrator:
                     self.checkpoint.update(batch_number, records_count, next_offset)
 
                     # UPDATE STATS
-                    self.stats["upserted"] += records_count
-                    self.stats["batches_processed"] += 1
+                    self.stats[UPSERTED_KEY] += records_count
+                    self.stats[BATCHES_PROCESSED_KEY] += 1
                     pbar.update(records_count)
                     upsert_time = end_time - start_time
                     throughput = records_count / upsert_time
                     logger.info(f"CONSUMER: SUCCESSFULLY UPSERTED {records_count} RECORDS IN {upsert_time:.2f} seconds WITH THROUGHPUT {throughput:.2f} records/second")
                 else:
-                    self.stats["failed"] += records_count
+                    self.stats[FAILED_KEY] += records_count
                     logger.error(f"CONSUMER: FAILED TO UPSERT BATCH {batch_number}")
                     self._stop_event.set()
                     queue.task_done()
@@ -314,8 +313,6 @@ class SimpleQdrantToEndeeMigrator:
         """Get collection configuration from Qdrant"""
         logger.info(f"Getting collection info for: {self.qdrant_collection}")
         # LIST ALL COLLECTIONS
-        collections = self.qdrant_client.get_collections()
-        print("collections: ",collections)
         collection_info = self.qdrant_client.get_collection(self.qdrant_collection)
         
         vectors = collection_info.config.params.vectors
@@ -348,7 +345,6 @@ class SimpleQdrantToEndeeMigrator:
         if collection_info.config.quantization_config:
             quantization_config = dict(collection_info.config.quantization_config)
             key = quantization_config.keys()
-            print("key: ",key)
             if "scalar" in key:
                 # QDRANT SUPPORT ONLY INT8 IN SCALAR
                 endee_precision = Precision.INT8
@@ -356,7 +352,6 @@ class SimpleQdrantToEndeeMigrator:
                 raise ValueError(f"Product quantization is not supported: {quantization_config}")
                 
             elif "binary" in key:
-                print("hurrey")
                 # DON'T SUPPORT ASYMMETRIC QUANTIZATION
                 binary_config = quantization_config.get("binary", {})
                 if "query_encoding" in binary_config:
@@ -501,8 +496,8 @@ class SimpleQdrantToEndeeMigrator:
             3. If queue is full, producer WAITS (no memory overflow!)
             4. If queue is empty, consumer WAITS (no busy waiting!)
         """
-        self.stats["start_time"] = time.time()
-        
+        self.stats[START_TIME_KEY] = time.time()
+
         if self.is_multivector:
             raise ValueError("Multivector mode is not supported for Qdrant to Endee dense migration")
         
@@ -646,7 +641,6 @@ def main():
     # if args.debug:
     #     logging.getLogger().setLevel(logging.DEBUG)
 
-    print("args.is_multivector_before: ",args.is_multivector)
     # Create migrator
     migrator = SimpleQdrantToEndeeMigrator(
         qdrant_url=args.source_url,
@@ -671,7 +665,6 @@ def main():
     
     # Run migration
     try:
-        print("before_migrate: ", bool(args.is_multivector))
         migrator.migrate()
     except KeyboardInterrupt:
         logger.warning("\nInterrupted by user. Progress has been saved.")
