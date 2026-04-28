@@ -313,7 +313,8 @@ class SimpleMilvusToEndeeMigrator:
             elif field_type in ['FLOAT_VECTOR', 'FLOAT16_VECTOR', 'BINARY_VECTOR',
                     DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, 
                      DataType.BINARY_VECTOR]:
-                index_info = self.milvus_client.describe_index(self.milvus_collection, field_name)
+                index_info = self.milvus_client.describe_index(self.milvus_collection, field_name) or {}
+                print(index_info)
                 self.ef_construct = index_info.get('params', {}).get('efConstruction', self.ef_construct)
                 self.M = index_info.get('params', {}).get('M', self.M)
                 params = field.get('params', {})
@@ -430,7 +431,7 @@ class SimpleMilvusToEndeeMigrator:
         try:
             results = await loop.run_in_executor(
                 None,
-                lambda: self.milvus_client.query(
+                lambda: self.milvus_client.query_iterator(
                     collection_name=self.milvus_collection,
                     filter="",
                     output_fields=["*"],
@@ -548,104 +549,112 @@ class SimpleMilvusToEndeeMigrator:
 
         return True
     
-    async def async_producer(self, queue:asyncio.Queue):
+    async def async_producer(self, queue: asyncio.Queue):
         """
-        Fetch batches from Milvus and put them into the queue.
+        Fetch batches from Milvus using QueryIterator (no offset limit).
 
-        Loop conditions — two checks for stop:
-          (A) while not self.interrupted and not self._stop_event.is_set()
-                checked at the TOP of every loop iteration
-          (B) if self._stop_event.is_set(): break  after queue.put()
-                closes the race window where the consumer could fail
-                 WHILE the producer is suspended inside queue.put()
-
-        Without check (B):
-          T1: Producer checks _stop_event -> False -> continues
-          T2: Producer calls await queue.put() → queue full → SUSPENDS
-          T3: Consumer fails -> _stop_event.set() -> task_done() -> unblocks producer
-          T4: Producer resumes from queue.put()
-          T5: Producer goes back to while condition -> checks _stop_event -> exits
-            Between T4 and T5 the loop body fetches one more batch from Milvus
-              a wasted network call.
-
-        With check (B):
-          T4: Producer resumes from queue.put()
-          T5: if _stop_event.is_set() -> True -> break  ← immediate, no extra fetch
+        QueryIterator handles pagination internally — no 16384 offset cap.
+        iterator.next() is synchronous, wrapped in run_in_executor to
+        avoid freezing the event loop during the network call.
         """
-                # Start migration
-        offset = self.checkpoint.get_last_offset()
+        loop = asyncio.get_running_loop()
         batch_number = self.checkpoint.get_batch_number()
+        processed_so_far = self.checkpoint.get_processed_count()
+
+        logger.info("PRODUCER: Creating Milvus query iterator")
+
+        # CREATE ITERATOR ONCE — it pages through all records internally
+        try:
+            iterator = await loop.run_in_executor(
+                None,
+                lambda: self.milvus_client.query_iterator(
+                    collection_name=self.milvus_collection,
+                    filter="",
+                    output_fields=["*"],
+                    batch_size=self.fetch_batch_size,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"PRODUCER: Failed to create iterator: {e}")
+            await queue.put(None)
+            return
+
+        # SKIP ALREADY-PROCESSED RECORDS FROM CHECKPOINT
+        if processed_so_far > 0:
+            skipped = 0
+            logger.info(f"PRODUCER: Skipping {processed_so_far} already-processed records (checkpoint)")
+            while skipped < processed_so_far:
+                batch = await loop.run_in_executor(None, iterator.next)
+                if not batch:
+                    logger.warning("PRODUCER: Ran out of records while skipping checkpoint — already fully migrated?")
+                    await loop.run_in_executor(None, iterator.close)
+                    await queue.put(None)
+                    return
+                skipped += len(batch)
+            logger.info(f"PRODUCER: Skipped {skipped} records, resuming from batch {batch_number}")
 
         logger.info("PRODUCER STARTED FETCHING FROM MILVUS")
 
         while not self.interrupted and not self._stop_event.is_set():
             try:
-                # FETCH BATCH FROM MILVUS
-                logger.info(f"FETCHING BATCH FROM MILVUS {batch_number} WITH OFFSET {offset}")
-                milvus_result = await self.async_fetch_batch(offset)
+                logger.info(f"FETCHING BATCH FROM MILVUS {batch_number}")
+                milvus_result = await loop.run_in_executor(None, iterator.next)
 
-                # CHECK IF MILVUS RESULT IS EMPTY
-                if not milvus_result or len(milvus_result) == 0:
+                # EMPTY RESULT = END OF COLLECTION
+                if not milvus_result:
                     logger.info("PRODUCER: No more data to fetch")
                     await queue.put(None)
                     break
-                
+
                 # CONVERT TO ENDEE FORMAT
                 records = self.convert_records(milvus_result)
-                
-                # UPDATE STATS
                 records_count = len(records)
                 self.stats[FETCHED_KEY] += records_count
+                current_offset = processed_so_far + self.stats[FETCHED_KEY]
+
                 logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
 
-                # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
+                # CHECK IF INTERRUPTED
                 if self.interrupted:
                     logger.info("PRODUCER: Interrupted by user")
                     await queue.put(None)
                     break
 
-                # PUT RECORDS INTO QUEUE
+                # PUT RECORDS INTO QUEUE (blocks if queue is full — backpressure)
                 await queue.put({
                     "batch_number": batch_number,
                     "records": records,
-                    "next_offset": offset + records_count
+                    "next_offset": current_offset,
                 })
-                
+
+                # CHECK STOP EVENT AFTER QUEUE PUT (closes race window)
                 if self._stop_event.is_set():
                     logger.warning("PRODUCER: Stopped due to Stop Event")
                     break
 
                 # TRACK QUEUE USAGE
                 current_size = queue.qsize()
-                if current_size > self.max_queue_size:
+                if current_size >= self.max_queue_size:
                     logger.warning(f"QUEUE IS FULL. CURRENT SIZE: {current_size}")
-
-                # MOVE TO NEXT BATCH
-                offset += records_count
-                batch_number  += 1
-
-                # # PUT NONE TO QUEUE IF OFFSET IS NONE
-                # if next_offset is None:
-                #     await queue.put(None)
-                #     break
 
                 # Show sample record structure (first batch only)
                 if batch_number == 0 and records:
                     logger.info(f"\nSample Endee record structure:")
                     sample = records[0].copy()
-                    # Truncate vector for display
-                    if 'vector' in sample and len(sample['vector']) > 5:
-                        sample['vector'] = f"[{sample['vector'][:3]}... ({len(sample['vector'])} dims)]"
-                    logger.info(json.dumps(sample, indent=2))
+                    if ENDEE_VECTOR_KEY in sample and len(sample[ENDEE_VECTOR_KEY]) > 5:
+                        sample[ENDEE_VECTOR_KEY] = f"[... ({len(sample[ENDEE_VECTOR_KEY])} dims)]"
+                    logger.info(json.dumps(sample, indent=2, default=str))
+
+                batch_number += 1
 
             except Exception as e:
                 logger.error(f"[Producer] Exception: {e}")
-                # import traceback
-                # logger.error(traceback.format_exc())
                 self._stop_event.set()
-                await queue.put(None)  # Signal error
+                await queue.put(None)
                 break
-        logger.info("PRODUCER FINISHED")
+
+        await loop.run_in_executor(None, iterator.close)
+        logger.info("PRODUCER: Iterator closed. Finished.")
 
     async def async_consumer(self, queue: asyncio.Queue, pbar: tqdm):
         """
