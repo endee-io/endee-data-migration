@@ -607,24 +607,59 @@ class AsyncHybridMilvusToEndeeMigrator:
     # ══════════════════════════════════════════════════════════════
     async def async_producer(self, queue: asyncio.Queue):
         """
-        Fetch batches from Milvus and put them into the queue.
+        Fetch batches from Milvus using QueryIterator (no 16384 offset cap).
+
+        iterator.next() is synchronous — wrapped in run_in_executor to
+        avoid freezing the event loop during the network call.
 
         Two stop checks:
           (A) while condition — top of every iteration
           (B) post-put check — closes race window where consumer fails
               WHILE producer is suspended inside await queue.put()
-
-        BUG 4 fix: on exception, set _stop_event BEFORE put(None).
         """
-        offset = self.checkpoint.get_last_offset()
+        loop = asyncio.get_running_loop()
         batch_number = self.checkpoint.get_batch_number()
+        processed_so_far = self.checkpoint.get_processed_count()
+
+        logger.info("PRODUCER: Creating Milvus query iterator")
+
+        # CREATE ITERATOR ONCE — pages through all records internally
+        try:
+            iterator = await loop.run_in_executor(
+                None,
+                lambda: self.milvus_client.query_iterator(
+                    collection_name=self.milvus_collection,
+                    filter="",
+                    output_fields=["*"],
+                    batch_size=self.fetch_batch_size,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"PRODUCER: Failed to create iterator: {e}")
+            await queue.put(None)
+            return
+
+        # SKIP ALREADY-PROCESSED RECORDS FROM CHECKPOINT
+        if processed_so_far > 0:
+            skipped = 0
+            logger.info(f"PRODUCER: Skipping {processed_so_far} already-processed records (checkpoint)")
+            while skipped < processed_so_far:
+                batch = await loop.run_in_executor(None, iterator.next)
+                if not batch:
+                    logger.warning("PRODUCER: Ran out of records while skipping — already fully migrated?")
+                    await loop.run_in_executor(None, iterator.close)
+                    await queue.put(None)
+                    return
+                skipped += len(batch)
+            logger.info(f"PRODUCER: Skipped {skipped} records, resuming from batch {batch_number}")
+
         logger.info("PRODUCER: started")
 
         try:
             while not self.interrupted and not self._stop_event.is_set():
-                logger.info(f"PRODUCER: fetching batch {batch_number} (offset={offset})")
+                logger.info(f"PRODUCER: fetching batch {batch_number}")
 
-                milvus_records, next_offset = await self.async_fetch_batch(offset)
+                milvus_records = await loop.run_in_executor(None, iterator.next)
 
                 # End of collection
                 if not milvus_records:
@@ -634,7 +669,9 @@ class AsyncHybridMilvusToEndeeMigrator:
 
                 # Convert
                 records = self.convert_records(milvus_records)
-                self.stats[FETCHED_KEY] += len(records)
+                records_count = len(records)
+                self.stats[FETCHED_KEY] += records_count
+                current_offset = processed_so_far + self.stats[FETCHED_KEY]
 
                 # Interrupt check (Ctrl+C arrived during fetch)
                 if self.interrupted:
@@ -642,11 +679,11 @@ class AsyncHybridMilvusToEndeeMigrator:
                     await queue.put(None)
                     break
 
-                # Put into queue — suspends here if queue is full (backpressure)
+                # Put into queue — suspends here if full (backpressure)
                 await queue.put({
                     "batch_number": batch_number,
                     "records": records,
-                    "next_offset": next_offset,
+                    "next_offset": current_offset,
                 })
 
                 # Post-put stop check — consumer may have failed while we waited
@@ -654,28 +691,17 @@ class AsyncHybridMilvusToEndeeMigrator:
                     logger.warning("PRODUCER: stop event after queue.put() — exiting")
                     break
 
-                # End of collection check (partial batch = last batch)
-                if len(milvus_records) < self.fetch_batch_size:
-                    logger.info(
-                        f"PRODUCER: partial batch ({len(milvus_records)} < "
-                        f"{self.fetch_batch_size}) — sending sentinel"
-                    )
-                    await queue.put(None)
-                    break
-
-                # Advance to next batch
-                offset = next_offset
                 batch_number += 1
 
         except Exception as e:
             logger.error(f"PRODUCER: exception — {e}")
             logger.error(traceback.format_exc())
-            # BUG 4 fix: signal first, then sentinel
             self._stop_event.set()
             await queue.put(None)
 
-        logger.info("PRODUCER: finished")
-
+        finally:
+            await loop.run_in_executor(None, iterator.close)
+            logger.info("PRODUCER: iterator closed. Finished.")
     # ══════════════════════════════════════════════════════════════
     # CONSUMER
     # ══════════════════════════════════════════════════════════════
