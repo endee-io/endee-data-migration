@@ -131,6 +131,7 @@ class SimpleMilvusToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
+        precision: str,
         milvus_port: int = DEFAULT_MILVUS_PORT,
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
         upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
@@ -140,7 +141,7 @@ class SimpleMilvusToEndeeMigrator:
         checkpoint_file: str = CHECKPOINT_FILE,
         filter_fields: str = "",
         is_multivector: bool = False,
-        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
@@ -156,7 +157,7 @@ class SimpleMilvusToEndeeMigrator:
         self.space_type = space_type
         self.M = M
         self.ef_construct = ef_construct
-        self.precision = Precision.FLOAT32
+        self.precision = precision
         self.is_multivector = is_multivector
         self.checkpoint = MigrationCheckpoint(checkpoint_file)
         self.interrupted = False
@@ -416,33 +417,33 @@ class SimpleMilvusToEndeeMigrator:
     #         offset=offset
     #     ))
     #     return results
-    async def async_fetch_batch(self, offset: int) -> list[Dict]:
-        """
-        Fetch one batch from Milvus.
+    # async def async_fetch_batch(self, offset: int) -> list[Dict]:
+    #     """
+    #     Fetch one batch from Milvus.
 
-        milvus_client.query() is a blocking synchronous call.
-        Wrapping it in run_in_executor frees the event loop during
-        the HTTP round-trip so the consumer can upsert concurrently.
+    #     milvus_client.query() is a blocking synchronous call.
+    #     Wrapping it in run_in_executor frees the event loop during
+    #     the HTTP round-trip so the consumer can upsert concurrently.
 
-        FIX: Without run_in_executor this call would freeze the event
-        loop for the entire HTTP duration — zero concurrency.
-        """
-        loop = asyncio.get_running_loop()
-        try:
-            results = await loop.run_in_executor(
-                None,
-                lambda: self.milvus_client.query_iterator(
-                    collection_name=self.milvus_collection,
-                    filter="",
-                    output_fields=["*"],
-                    limit=self.fetch_batch_size,
-                    offset=offset,
-                ),
-            )
-            return results or []
-        except Exception as e:
-            logger.error(f"Error fetching batch at offset {offset}: {e}")
-            raise  # re-raise so producer can handle it
+    #     FIX: Without run_in_executor this call would freeze the event
+    #     loop for the entire HTTP duration — zero concurrency.
+    #     """
+    #     loop = asyncio.get_running_loop()
+    #     try:
+    #         results = await loop.run_in_executor(
+    #             None,
+    #             lambda: self.milvus_client.query(
+    #                 collection_name=self.milvus_collection,
+    #                 filter="",
+    #                 output_fields=["*"],
+    #                 limit=self.fetch_batch_size,
+    #                 offset=offset,
+    #             ),
+    #         )
+    #         return results or []
+    #     except Exception as e:
+    #         logger.error(f"Error fetching batch at offset {offset}: {e}")
+    #         raise  # re-raise so producer can handle it
 
     
     def convert_records(self, milvus_records) -> list:
@@ -887,6 +888,8 @@ def main():
     parser.add_argument("--debug", action="store_true", 
                        default=os.getenv("DEBUG",False),
                        help="Enable debug logging")
+
+    parser.add_argument("--precision", default=Precision.INT16)
     
     args = parser.parse_args()
     
@@ -910,7 +913,8 @@ def main():
         ef_construct=args.ef_construct,
         checkpoint_file=args.checkpoint_file,
         filter_fields=args.filter_fields,
-        is_multivector=args.is_multivector
+        is_multivector=args.is_multivector,
+        precision=args.precision
     )
     
     # Clear checkpoint if requested

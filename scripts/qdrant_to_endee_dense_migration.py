@@ -43,8 +43,8 @@ class MigrationCheckpoint:
             }
 
         try:
-            with open(self.checkpoint_file, 'r') as f:
-                data = orjson.load(f)
+            with open(self.checkpoint_file, 'rb') as f:
+                data = orjson.loads(f.read())
                 logger.info(f"✓ Loaded checkpoint: {data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)} records processed")
                 return data
         except FileNotFoundError:
@@ -285,6 +285,8 @@ class SimpleQdrantToEndeeMigrator:
 
                 # UPSERT SUCCESSFULLY
                 if success:
+                    logger.info(f"UPSERTED BATCH {batch_number} TO ENDEE")
+
                     # UPDATE CHECKPOINT FIELDS
                     self.checkpoint.update(batch_number, records_count, next_offset)
 

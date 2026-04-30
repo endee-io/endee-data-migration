@@ -1,4 +1,4 @@
-CHECKPOINT_FILE = "./migration_checkpoint.json"
+CHECKPOINT_FILE = "/app/data/checkpoints/migration.json"
 
 # Collection config keys
 DIMENSION_KEY = "dimension"

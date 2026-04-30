@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  migration:
+    image: vector-migration:latest
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - vector-net
+    stdin_open: true
+    tty: true
+    ports:
+      - "5678:5678"       # expose debugpy port
+    environment:
+      - DEBUG_REMOTE=1
+      - PYTHONUNBUFFERED=1
+
+networks:
+  vector-net:
+    external: true
