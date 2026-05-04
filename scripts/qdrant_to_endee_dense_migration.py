@@ -70,7 +70,12 @@ class MigrationCheckpoint:
         self.data[BATCH_NUMBER_KEY] = batch_number
         if offset is not None:
             self.data[LAST_OFFSET_KEY] = offset
+        else:
+            self.data[COMPLETED_KEY] = True
         self.save()
+
+    def is_completed(self) -> bool:
+        return self.data.get(COMPLETED_KEY, False)
     
     def get_last_offset(self):
         """Get the last processed offset"""
@@ -89,7 +94,8 @@ class MigrationCheckpoint:
         self.data = {
             PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
             LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
-            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+            COMPLETED_KEY: False
         }
         self.save()
 
@@ -499,7 +505,9 @@ class SimpleQdrantToEndeeMigrator:
             4. If queue is empty, consumer WAITS (no busy waiting!)
         """
         self.stats[START_TIME_KEY] = time.time()
-
+        if self.checkpoint.is_completed():
+            logger.info("Migration already completed. Use --clear_checkpoint to re-run.")
+            return
         if self.is_multivector:
             raise ValueError("Multivector mode is not supported for Qdrant to Endee dense migration")
         

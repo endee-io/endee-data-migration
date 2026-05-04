@@ -16,7 +16,9 @@ import numpy as np
 import asyncio
 import orjson
 from constants import *
-dotenv.load_dotenv()
+import orjson
+import os
+
 
 # Configure logging
 logging.basicConfig(
@@ -38,7 +40,13 @@ MILVUS_STR_TO_ENDEE_PRECISION = {
     'BFLOAT16_VECTOR': Precision.FLOAT16,
     'BINARY_VECTOR':   Precision.BINARY2,
 }
-
+PRECISION_STR_TO_ENDEE = {
+    "float32": Precision.FLOAT32,
+    "float16": Precision.FLOAT16,
+    "int8":    Precision.INT8,
+    "int16":   Precision.INT16,
+    "binary":  Precision.BINARY2,
+}
 
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
@@ -53,12 +61,13 @@ class MigrationCheckpoint:
         exception_resposne = {
                 PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
                 LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
-                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+                COMPLETED_KEY: False
             }
 
         try:
-            with open(self.checkpoint_file, 'r') as f:
-                data = json.load(f)
+            with open(self.checkpoint_file, 'rb') as f:
+                data = orjson.loads(f.read())
                 logger.info(f"✓ Loaded checkpoint: {data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)} records processed")
                 return data
         except FileNotFoundError:
@@ -86,6 +95,15 @@ class MigrationCheckpoint:
         self.data[LAST_OFFSET_KEY] = offset
         self.save()
     
+    def mark_completed(self):
+        """Call when producer signals natural end of data"""
+        self.data[COMPLETED_KEY] = True
+        self.save()
+    
+    def is_completed(self) -> bool:
+        return self.data.get(COMPLETED_KEY, False)
+
+    
     def get_last_offset(self) -> int:
         """Get the last processed offset"""
         return self.data.get(LAST_OFFSET_KEY, 0)
@@ -99,17 +117,17 @@ class MigrationCheckpoint:
         return self.data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)
 
     def clear(self):
-        """Clear checkpoint for fresh start"""
         self.data = {
             PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
-            LAST_OFFSET_KEY: DEFAULT_PROCESSED_COUNT,
-            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+            LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,       # ← fixed typo
+            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+            COMPLETED_KEY: False
         }
         self.save()
 
 
 class SimpleMilvusToEndeeMigrator:
-    """Simple sequential migration from Milvus (Dense) to Endee
+    """Migration from Milvus (Dense) to Endee
         Async producer-consumer migration from Milvus (dense) to Endee.
 
         Architecture:
@@ -322,26 +340,31 @@ class SimpleMilvusToEndeeMigrator:
                 dim = params.get('dim') or field.get('dim')
                 
                 # Detect precision from field type
-                precision = (
+                detected_precision = (
                     MILVUS_DTYPE_TO_ENDEE_PRECISION.get(field_type) or
                     MILVUS_STR_TO_ENDEE_PRECISION.get(field_type) or
-                    Precision.FLOAT32  # fallback
+                    Precision.INT16  # fallback
                 )
                 
                 vector_fields.append({
                     'name': field_name,
                     'type': field_type,
                     'dimension': dim,
-                    'precision': precision   # ← store per vector field
+                    'precision': detected_precision   # ← store per vector field
                 })
                 
                 # Use the first vector field found
                 if self.vector_field_name is None:
                     self.vector_field_name = field_name
                     self.vectors_dimension = dim
-                    self.precision = precision  # ← set on self
+                    # Priority: user-provided > metadata > INT16 default
+                    if self.precision is None:
+                        self.precision = detected_precision
+                        logger.info(f"  Precision: auto-detected from metadata → {self.precision}")
+                    else:
+                        logger.info(f"  Precision: user-specified → {self.precision}")
                 
-                logger.info(f"✓ Vector Field: '{field_name}' [{field_type}, dim={dim}, precision={precision}]")
+                logger.info(f"✓ Vector Field: '{field_name}' [{field_type}, dim={dim}, precision={self.precision}]")
             
             # Other fields
             else:
@@ -681,6 +704,14 @@ class SimpleMilvusToEndeeMigrator:
         while not self.interrupted:
             # GET BATCH FROM QUEUE
             batch = await queue.get()
+            if batch is None:
+                queue.task_done()
+                logger.info("CONSUMER: RECEIVED END SIGNAL")
+                # Only mark completed if not interrupted or errored
+                if not self.interrupted and not self._stop_event.is_set():
+                    self.checkpoint.mark_completed()
+                    logger.info("CONSUMER: Migration marked as completed in checkpoint")
+                break
 
             if batch is None:
                 queue.task_done()
@@ -733,6 +764,11 @@ class SimpleMilvusToEndeeMigrator:
             4. If queue is empty, consumer WAITS (no busy waiting!)
         """
         self.stats[START_TIME_KEY] = time.time()
+        if self.checkpoint.is_completed():
+            logger.warning("Previous migration is already complete.")
+            logger.warning(f"Migrated: {self.checkpoint.get_processed_count()} records.")
+            logger.warning("Use --clear_checkpoint to re-run.")
+            return
         if self.is_multivector:
             raise ValueError("Multivector mode is not supported for Milvus to Endee dense migration")
         
@@ -889,13 +925,27 @@ def main():
                        default=os.getenv("DEBUG",False),
                        help="Enable debug logging")
 
-    parser.add_argument("--precision", default=Precision.INT16)
+    # parser.add_argument("--precision", default=Precision.INT16)
+    parser.add_argument("--precision", default=os.getenv("PRECISION", None),
+                    help="Vector precision override (float32/float16/int8/int16/binary). "
+                         "If not set, auto-detected from source DB, fallback to INT16.")
     
     args = parser.parse_args()
     
     # # Set debug level if requested
     # if args.debug:
     #     logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.precision is not None:
+        if args.precision == "":
+            precision=None
+        else:
+            precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
+            if precision is None:
+                logger.error(f"Invalid precision value: '{args.precision}'. "
+                            f"Valid options: {list(PRECISION_STR_TO_ENDEE.keys())}")
+                sys.exit(1)
+        args.precision = precision
     
     # Create migrator
     migrator = SimpleMilvusToEndeeMigrator(

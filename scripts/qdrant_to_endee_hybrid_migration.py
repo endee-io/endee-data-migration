@@ -38,11 +38,12 @@ class MigrationCheckpoint:
         exception_resposne = {
                 PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
                 LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
-                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+                COMPLETED_KEY: False
             }
 
         try:
-            with open(self.checkpoint_file, 'r') as f:
+            with open(self.checkpoint_file, 'rb') as f:
                 data = orjson.loads(f.read())
                 logger.info(f"✓ Loaded checkpoint: {data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)} records processed")
                 return data
@@ -56,18 +57,27 @@ class MigrationCheckpoint:
     def save(self):
         """Save checkpoint to file"""
         try:
+            dirpath = os.path.dirname(self.checkpoint_file)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
             with open(self.checkpoint_file, 'wb') as f:
                 f.write(orjson.dumps(self.data, option=orjson.OPT_INDENT_2))
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
     
     def update(self, batch_number: int, records_count: int, offset: Optional[Any] = None):
-        """Update checkpoint after successful batch"""
         self.data[PROCESSED_COUNT_KEY] += records_count
         self.data[BATCH_NUMBER_KEY] = batch_number
-        if offset is not None:
-            self.data[LAST_OFFSET_KEY] = offset
+        self.data[LAST_OFFSET_KEY] = offset  # saves None explicitly when migration finishes
         self.save()
+    
+    def mark_completed(self):
+        self.data[COMPLETED_KEY] = True
+        self.save()
+
+    def is_completed(self) -> bool:
+        return self.data.get(COMPLETED_KEY, False)
+
     
     def get_last_offset(self):
         """Get the last processed offset"""
@@ -82,11 +92,11 @@ class MigrationCheckpoint:
         return self.data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)
     
     def clear(self):
-        """Clear checkpoint for fresh start"""
         self.data = {
             PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
             LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
-            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+            COMPLETED_KEY: False
         }
         self.save()
 
@@ -266,6 +276,10 @@ class QdrantHybridToEndeeMigrator:
                 if batch is None:
                     logger.info("CONSUMER: RECEIVED END SIGNAL")
                     queue.task_done()
+                    # Mark completed only if not interrupted or errored
+                    if not self.interrupted and not self._stop_event.is_set():
+                        self.checkpoint.mark_completed()
+                        logger.info("CONSUMER: Migration marked as completed in checkpoint")
                     break
 
                 batch_number = batch.get("batch_number")
@@ -605,6 +619,14 @@ class QdrantHybridToEndeeMigrator:
             4. If queue is empty, consumer WAITS (no busy waiting!)
         """
         self.stats[START_TIME_KEY] = time.time()
+        # Guard against re-running a completed migration
+        if self.checkpoint.is_completed():
+            logger.warning("="*80)
+            logger.warning("Previous migration is already COMPLETE.")
+            logger.warning(f"Already migrated: {self.checkpoint.get_processed_count()} records.")
+            logger.warning("Use --clear_checkpoint to re-run.")
+            logger.warning("="*80)
+            return
 
         logger.info("="*80)
         logger.info("ASYNC HYBRID MIGRATION STARTED")
