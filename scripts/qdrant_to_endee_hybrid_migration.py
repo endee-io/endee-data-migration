@@ -24,6 +24,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PRECISION_STR_TO_ENDEE = {
+    "float32": Precision.FLOAT32,
+    "int8":    Precision.INT8,
+    "int16":   Precision.INT16,
+    "binary":  Precision.BINARY2,
+}
+
 
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
@@ -113,6 +120,7 @@ class QdrantHybridToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
+        precision: str = None,
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
         upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
         use_https: bool = False,
@@ -136,6 +144,7 @@ class QdrantHybridToEndeeMigrator:
         self.interrupted = False
         self.max_queue_size = max_queue_size
         self.is_multivector = is_multivector
+        self.precision = precision
         # Clients
         self.qdrant_client = None
         self.endee_client = None
@@ -209,7 +218,9 @@ class QdrantHybridToEndeeMigrator:
             try:
                 # FETCH BATCH FROM QDRANT
                 logger.debug(f"FETCHING BATCH FROM QDRANT {batch_number} WITH OFFSET {offset}")
+                fetch_start = time.time()
                 points_batch, next_offset = await self.async_fetch_batch(offset)
+                fetch_time = time.time() - fetch_start
                 
                 # CHECK IF POINTS BATCH IS EMPTY
                 if not points_batch:
@@ -218,10 +229,17 @@ class QdrantHybridToEndeeMigrator:
                     break
                 
                 # CONVERT TO ENDEE FORMAT
+                transform_start = time.time()
                 records = self.convert_records(points_batch)
+                transform_time = time.time() - transform_start
 
                 # UPDATE STATS
                 self.stats[FETCHED_KEY] += len(records)
+
+                logger.info(
+                    f"[Batch {batch_number}] Fetched {len(records)} records | "
+                    f"fetch={fetch_time:.2f}s | transform={transform_time:.2f}s"
+                )
 
                 # CHECK IF INTERRUPTED THAT IS CTRL+C OR TERMINAL KILL
                 if self.interrupted:
@@ -233,7 +251,10 @@ class QdrantHybridToEndeeMigrator:
                 await queue.put({
                     "batch_number": batch_number,
                     "records": records,
-                    "next_offset": next_offset
+                    "next_offset": next_offset,
+                    "fetch_time": fetch_time,
+                    "transform_time": transform_time,
+                    "enqueue_time": time.time(),
                 })
                 if self._stop_event.is_set():
                     logger.warning("PRODUCER: Stopped due to Stop Event")
@@ -285,28 +306,38 @@ class QdrantHybridToEndeeMigrator:
                 batch_number = batch.get("batch_number")
                 records = batch.get("records")
                 next_offset = batch.get("next_offset")
+                fetch_time     = batch.get("fetch_time", 0)
+                transform_time = batch.get("transform_time", 0)
+                enqueue_time   = batch.get("enqueue_time", time.time())
                 records_count = len(records)
+
+                queue_wait_time = time.time() - enqueue_time
 
                 # UPSERT TO ENDEE
                 logger.info(f"UPSERTING BATCH {batch_number} TO ENDEE")
-                start_time = time.time()
-
+                upsert_start = time.time()
                 success = await self.async_upsert_records(records)
-
-                end_time = time.time()
+                upsert_time = time.time() - upsert_start
 
                 # UPSERT SUCCESSFULLY
                 if success:
                     # UPDATE CHECKPOINT FIELDS
                     self.checkpoint.update(batch_number, records_count, next_offset)
-
-                    # UPDATE STATS
                     self.stats[UPSERTED_KEY] += records_count
                     self.stats[BATCHES_PROCESSED_KEY] += 1
                     pbar.update(records_count)
-                    upsert_time = end_time - start_time
-                    throughput = records_count / upsert_time
-                    logger.info(f"CONSUMER: SUCCESSFULLY UPSERTED {records_count} RECORDS IN {upsert_time:.2f} seconds WITH THROUGHPUT {throughput:.2f} records/second")
+                    queue.task_done()
+                    throughput = records_count / upsert_time if upsert_time > 0 else 0
+                    total_time = fetch_time + transform_time + queue_wait_time + upsert_time
+                    logger.info(
+                        f"[Batch {batch_number}]  {records_count} records | "
+                        f"fetch={fetch_time:.2f}s | "
+                        f"transform={transform_time:.2f}s | "
+                        f"queue_wait={queue_wait_time:.2f}s | "
+                        f"upsert={upsert_time:.2f}s | "
+                        f"total={total_time:.2f}s | "
+                        f"throughput={throughput:.1f} rec/s"
+                    )
                     
                 else:
                     self.stats[FAILED_KEY] += records_count
@@ -317,7 +348,7 @@ class QdrantHybridToEndeeMigrator:
                     break
                 
                 # UNFINISHED TASKS REDUCE BY 1
-                queue.task_done()
+                # queue.task_done()
             except Exception as e:
                 logger.error(f"[Consumer] Exception: {e}")
                 import traceback
@@ -428,9 +459,16 @@ class QdrantHybridToEndeeMigrator:
                 else:
                     raise ValueError(f"Invalid binary quantization encoding: {encoding}")
             else:
-                endee_precision = Precision.FLOAT32
+                endee_precision = Precision.INT16
         else:
-            endee_precision = Precision.FLOAT32
+            endee_precision = Precision.INT16
+
+        # User-specified precision overrides auto-detection
+        if self.precision is not None:
+            logger.info(f"  Precision: user-specified: {self.precision}")
+            endee_precision = self.precision
+        else:
+            logger.info(f"  Precision: auto-detected: {endee_precision}")
         
         
         config = {
@@ -774,12 +812,33 @@ def main():
     parser.add_argument("--max_queue_size", type=int, default=os.getenv("MAX_QUEUE_SIZE",5),
                        help="Max queue size (default: 5)")
 
+    parser.add_argument(
+        "--precision",
+        default=os.getenv("PRECISION", None),
+        help="Vector precision override (float32/int8/int16/binary). "
+             "If not set, auto-detected from Qdrant quantization config, fallback to INT16."
+    )
+
+
     
     args = parser.parse_args()
     
     # # Set debug level if requested
     # if args.debug:
     #     logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.precision is not None:
+        if args.precision == "":
+            precision = None
+        else:
+            precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
+            if precision is None:
+                logger.error(
+                    f"Invalid precision value: '{args.precision}'. "
+                    f"Valid options: {list(PRECISION_STR_TO_ENDEE.keys())}"
+                )
+                sys.exit(1)
+        args.precision = precision
     
     # Create migrator
     migrator = QdrantHybridToEndeeMigrator(
@@ -796,7 +855,8 @@ def main():
         use_https=args.use_https,
         checkpoint_file=args.checkpoint_file,
         filter_fields=args.filter_fields,
-        is_multivector=args.is_multivector
+        is_multivector=args.is_multivector,
+        precision=args.precision,
     )
     
     # Clear checkpoint if requested

@@ -622,8 +622,9 @@ class SimpleMilvusToEndeeMigrator:
         while not self.interrupted and not self._stop_event.is_set():
             try:
                 logger.info(f"FETCHING BATCH FROM MILVUS {batch_number}")
+                fetch_start = time.time()
                 milvus_result = await loop.run_in_executor(None, iterator.next)
-
+                fetch_time = time.time() - fetch_start
                 # EMPTY RESULT = END OF COLLECTION
                 if not milvus_result:
                     logger.info("PRODUCER: No more data to fetch")
@@ -631,12 +632,18 @@ class SimpleMilvusToEndeeMigrator:
                     break
 
                 # CONVERT TO ENDEE FORMAT
+                transform_start = time.time()
                 records = self.convert_records(milvus_result)
+                transform_time = time.time() - transform_start
+
                 records_count = len(records)
                 self.stats[FETCHED_KEY] += records_count
                 current_offset = processed_so_far + self.stats[FETCHED_KEY]
 
-                logger.info(f"[Batch {batch_number}] Fetched {records_count} records")
+                logger.info(
+                    f"[Batch {batch_number}] Fetched {records_count} records | "
+                    f"fetch={fetch_time:.2f}s | transform={transform_time:.2f}s"
+                )
 
                 # CHECK IF INTERRUPTED
                 if self.interrupted:
@@ -649,6 +656,9 @@ class SimpleMilvusToEndeeMigrator:
                     "batch_number": batch_number,
                     "records": records,
                     "next_offset": current_offset,
+                    "enqueue_time": time.time(),       # ← carry timestamp into consumer
+                    "fetch_time": fetch_time,
+                    "transform_time": transform_time,
                 })
 
                 # CHECK STOP EVENT AFTER QUEUE PUT (closes race window)
@@ -721,11 +731,21 @@ class SimpleMilvusToEndeeMigrator:
             records_count = len(records)
             batch_number = batch.get("batch_number")
             next_offset = batch.get("next_offset")
+            enqueue_time  = batch.get("enqueue_time", time.time())
+            fetch_time    = batch.get("fetch_time", 0)
+            transform_time = batch.get("transform_time", 0)
 
             logger.info(f"CONSUMER: RECEIVED BATCH {batch_number} WITH {records_count} RECORDS")
             logger.info(f"CONSUMER: UPSERTING {records_count} RECORDS TO ENDEE")
+            # ── QUEUE WAIT TIME ───────────────────────────────────────
+            queue_wait_time = time.time() - enqueue_time
+            logger.info(
+                f"[Batch {batch_number}] Queue wait time: {queue_wait_time:.2f}s"
+            )
 
+            upsert_start = time.time()
             success = await self.async_upsert_records(records)
+            upsert_time = time.time() - upsert_start
 
             if success:
                 # ── Update checkpoint ONLY on full success ─────────
@@ -736,9 +756,17 @@ class SimpleMilvusToEndeeMigrator:
                 self.stats[UPSERTED_KEY] += records_count
                 self.stats[BATCHES_PROCESSED_KEY] += 1
                 pbar.update(records_count)
-                queue.task_done()  # unblock producer
+                queue.task_done()
+                throughput = records_count / upsert_time if upsert_time > 0 else 0
+                total_time = fetch_time + transform_time + queue_wait_time + upsert_time
                 logger.info(
-                    f"[Batch {batch_number}] ✓ Upserted {records_count} records"
+                    f"[Batch {batch_number}]  {records_count} records | "
+                    f"fetch={fetch_time:.2f}s | "
+                    f"transform={transform_time:.2f}s | "
+                    f"queue_wait={queue_wait_time:.2f}s | "
+                    f"upsert={upsert_time:.2f}s | "
+                    f"total={total_time:.2f}s | "
+                    f"throughput={throughput:.1f} rec/s"
                 )
             else:
                 # ── Failure path — ORDER MATTERS ───────────────────
