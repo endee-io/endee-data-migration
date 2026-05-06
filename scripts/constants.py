@@ -1,4 +1,4 @@
-CHECKPOINT_FILE = "./migration_checkpoint.json"
+CHECKPOINT_FILE = "/app/data/checkpoints/migration.json"
 
 # Collection config keys
 DIMENSION_KEY = "dimension"
@@ -53,3 +53,4 @@ DEFAULT_PROCESSED_COUNT = 0
 DEFAULT_LAST_OFFSET = None
 DEFAULT_BATCH_NUMBER = 0
 DEFAULT_MAX_QUEUE_SIZE = 5
+COMPLETED_KEY = "completed"

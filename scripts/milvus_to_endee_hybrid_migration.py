@@ -13,6 +13,7 @@ import dotenv
 import numpy as np
 from endee import Endee, Precision
 from endee.exceptions import NotFoundException
+import orjson
 from pymilvus import DataType, MilvusClient
 from tqdm import tqdm
 import argparse
@@ -38,6 +39,14 @@ MILVUS_STR_TO_ENDEE_PRECISION = {
     "BFLOAT16_VECTOR": Precision.FLOAT16,
     "BINARY_VECTOR":   Precision.BINARY2,
 }
+PRECISION_STR_TO_ENDEE = {
+    "float32": Precision.FLOAT32,
+    "float16": Precision.FLOAT16,
+    "int8":    Precision.INT8,
+    "int16":   Precision.INT16,
+    "binary":  Precision.BINARY2,
+}
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -56,12 +65,13 @@ class MigrationCheckpoint:
         exception_resposne = {
                 PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
                 LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
-                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+                BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+                COMPLETED_KEY: False
             }
 
         try:
-            with open(self.checkpoint_file, "r") as f:
-                data = json.load(f)
+            with open(self.checkpoint_file, "rb") as f:
+                data = orjson.loads(f.read())
                 logger.info(f"✓ Loaded checkpoint: {data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)} records processed")
                 return data
         except FileNotFoundError:
@@ -73,8 +83,11 @@ class MigrationCheckpoint:
     
     def save(self):
         try:
-            with open(self.checkpoint_file, "w") as f:
-                json.dump(self.data, f, indent=2)
+            dirpath = os.path.dirname(self.checkpoint_file)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(self.checkpoint_file, 'wb') as f:   # wb + orjson
+                f.write(orjson.dumps(self.data, option=orjson.OPT_INDENT_2))
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
@@ -84,6 +97,13 @@ class MigrationCheckpoint:
         self.data[BATCH_NUMBER_KEY] = batch_number
         self.data[LAST_OFFSET_KEY] = offset
         self.save()
+
+    def mark_completed(self):
+        self.data[COMPLETED_KEY] = True
+        self.save()
+
+    def is_completed(self) -> bool:
+        return self.data.get(COMPLETED_KEY, False)
 
     def get_last_offset(self) -> int:
         """Get the last processed offset"""
@@ -98,13 +118,14 @@ class MigrationCheckpoint:
         return self.data.get(PROCESSED_COUNT_KEY, DEFAULT_PROCESSED_COUNT)
     
     def clear(self):
-        """Clear checkpoint for fresh start"""
         self.data = {
             PROCESSED_COUNT_KEY: DEFAULT_PROCESSED_COUNT,
             LAST_OFFSET_KEY: DEFAULT_LAST_OFFSET,
-            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER
+            BATCH_NUMBER_KEY: DEFAULT_BATCH_NUMBER,
+            COMPLETED_KEY: False
         }
         self.save()
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -134,6 +155,7 @@ class AsyncHybridMilvusToEndeeMigrator:
         endee_url: str,
         endee_api_key: str,
         endee_index: str,
+        precision: str,
         milvus_port: int = DEFAULT_MILVUS_PORT,
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
         upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
@@ -144,6 +166,7 @@ class AsyncHybridMilvusToEndeeMigrator:
         filter_fields: str = "",
         is_multivector: bool = False,
         max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
+
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
@@ -161,9 +184,9 @@ class AsyncHybridMilvusToEndeeMigrator:
         self.space_type = space_type
         self.M = M
         self.ef_construct = ef_construct
-        self.precision = Precision.FLOAT32   # overwritten by detect_vector_fields()
         self.is_multivector = is_multivector
         self.max_queue_size = max_queue_size
+        self.precision = precision
 
         self.checkpoint = MigrationCheckpoint(checkpoint_file)
         self.interrupted = False          # plain bool — safe from signal handler
@@ -218,7 +241,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                     uri = f"http://{uri}:{self.milvus_port}"
                     logger.info(f"Added protocol to URI: {uri}")
             self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
-            self.endee_client.list_indexes()
+            # self.endee_client.list_indexes()
             logger.info("✓ Connected to Milvus")
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
@@ -339,7 +362,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                 precision = (
                     MILVUS_DTYPE_TO_ENDEE_PRECISION.get(ftype)
                     or MILVUS_STR_TO_ENDEE_PRECISION.get(ftype)
-                    or Precision.FLOAT32
+                    or Precision.INT16 
                 )
                 # Read HNSW params from index
                 self.ef_construct = index_info.get("params", {}).get("efConstruction", self.ef_construct)
@@ -350,10 +373,15 @@ class AsyncHybridMilvusToEndeeMigrator:
                 )
                 if self.dense_vector_field_name is None:
                     self.dense_vector_field_name = name
-                    self.dense_vector_field_type = ftype   # BUG 6 FIX
+                    self.dense_vector_field_type = ftype
                     self.vectors_dimension = dim
-                    self.precision = precision
-                logger.info(f"✓ Dense Vector Field: '{name}' [{ftype}, dim={dim}]")
+                    # Priority: user-provided (env/CLI) > metadata > INT16 default
+                    if self.precision is None:
+                        self.precision = precision
+                        logger.info(f"  Precision: auto-detected from metadata → {self.precision}")
+                    else:
+                        logger.info(f"  Precision: user-specified via env/CLI → {self.precision}")
+                logger.info(f"✓ Dense Vector Field: '{name}' [{ftype}, dim={dim}, precision={self.precision}]")
 
             elif ftype in ["SPARSE_FLOAT_VECTOR", DataType.SPARSE_FLOAT_VECTOR]:
                 sparse_vector_fields.append({"name": name, "type": ftype})
@@ -607,24 +635,61 @@ class AsyncHybridMilvusToEndeeMigrator:
     # ══════════════════════════════════════════════════════════════
     async def async_producer(self, queue: asyncio.Queue):
         """
-        Fetch batches from Milvus and put them into the queue.
+        Fetch batches from Milvus using QueryIterator (no 16384 offset cap).
+
+        iterator.next() is synchronous — wrapped in run_in_executor to
+        avoid freezing the event loop during the network call.
 
         Two stop checks:
           (A) while condition — top of every iteration
           (B) post-put check — closes race window where consumer fails
               WHILE producer is suspended inside await queue.put()
-
-        BUG 4 fix: on exception, set _stop_event BEFORE put(None).
         """
-        offset = self.checkpoint.get_last_offset()
+        loop = asyncio.get_running_loop()
         batch_number = self.checkpoint.get_batch_number()
+        processed_so_far = self.checkpoint.get_processed_count()
+
+        logger.info("PRODUCER: Creating Milvus query iterator")
+
+        # CREATE ITERATOR ONCE — pages through all records internally
+        try:
+            iterator = await loop.run_in_executor(
+                None,
+                lambda: self.milvus_client.query_iterator(
+                    collection_name=self.milvus_collection,
+                    filter="",
+                    output_fields=["*"],
+                    batch_size=self.fetch_batch_size,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"PRODUCER: Failed to create iterator: {e}")
+            await queue.put(None)
+            return
+
+        # SKIP ALREADY-PROCESSED RECORDS FROM CHECKPOINT
+        if processed_so_far > 0:
+            skipped = 0
+            logger.info(f"PRODUCER: Skipping {processed_so_far} already-processed records (checkpoint)")
+            while skipped < processed_so_far:
+                batch = await loop.run_in_executor(None, iterator.next)
+                if not batch:
+                    logger.warning("PRODUCER: Ran out of records while skipping — already fully migrated?")
+                    await loop.run_in_executor(None, iterator.close)
+                    await queue.put(None)
+                    return
+                skipped += len(batch)
+            logger.info(f"PRODUCER: Skipped {skipped} records, resuming from batch {batch_number}")
+
         logger.info("PRODUCER: started")
 
         try:
             while not self.interrupted and not self._stop_event.is_set():
-                logger.info(f"PRODUCER: fetching batch {batch_number} (offset={offset})")
+                logger.info(f"PRODUCER: fetching batch {batch_number}")
 
-                milvus_records, next_offset = await self.async_fetch_batch(offset)
+                fetch_start = time.time()
+                milvus_records = await loop.run_in_executor(None, iterator.next)
+                fetch_time = time.time() - fetch_start
 
                 # End of collection
                 if not milvus_records:
@@ -633,8 +698,19 @@ class AsyncHybridMilvusToEndeeMigrator:
                     break
 
                 # Convert
+                transform_start = time.time()
                 records = self.convert_records(milvus_records)
-                self.stats[FETCHED_KEY] += len(records)
+                transform_time = time.time() - transform_start
+
+                records_count = len(records)
+                self.stats[FETCHED_KEY] += records_count
+                current_offset = processed_so_far + self.stats[FETCHED_KEY]
+
+                logger.info(
+                    f"[Batch {batch_number}] Fetched {records_count} records | "
+                    f"fetch={fetch_time:.2f}s | transform={transform_time:.2f}s"
+                )
+
 
                 # Interrupt check (Ctrl+C arrived during fetch)
                 if self.interrupted:
@@ -642,11 +718,14 @@ class AsyncHybridMilvusToEndeeMigrator:
                     await queue.put(None)
                     break
 
-                # Put into queue — suspends here if queue is full (backpressure)
+                # Put into queue — suspends here if full (backpressure)
                 await queue.put({
                     "batch_number": batch_number,
                     "records": records,
-                    "next_offset": next_offset,
+                    "next_offset": current_offset,
+                    "fetch_time": fetch_time,
+                    "transform_time": transform_time,
+                    "enqueue_time": time.time(),
                 })
 
                 # Post-put stop check — consumer may have failed while we waited
@@ -654,28 +733,17 @@ class AsyncHybridMilvusToEndeeMigrator:
                     logger.warning("PRODUCER: stop event after queue.put() — exiting")
                     break
 
-                # End of collection check (partial batch = last batch)
-                if len(milvus_records) < self.fetch_batch_size:
-                    logger.info(
-                        f"PRODUCER: partial batch ({len(milvus_records)} < "
-                        f"{self.fetch_batch_size}) — sending sentinel"
-                    )
-                    await queue.put(None)
-                    break
-
-                # Advance to next batch
-                offset = next_offset
                 batch_number += 1
 
         except Exception as e:
             logger.error(f"PRODUCER: exception — {e}")
             logger.error(traceback.format_exc())
-            # BUG 4 fix: signal first, then sentinel
             self._stop_event.set()
             await queue.put(None)
 
-        logger.info("PRODUCER: finished")
-
+        finally:
+            await loop.run_in_executor(None, iterator.close)
+            logger.info("PRODUCER: iterator closed. Finished.")
     # ══════════════════════════════════════════════════════════════
     # CONSUMER
     # ══════════════════════════════════════════════════════════════
@@ -707,30 +775,44 @@ class AsyncHybridMilvusToEndeeMigrator:
                 if batch is None:
                     queue.task_done()
                     logger.info("CONSUMER: received sentinel — exiting")
+                    # Mark completed only on natural end (not interrupted or errored)
+                    if not self.interrupted and not self._stop_event.is_set():
+                        self.checkpoint.mark_completed()
+                        logger.info("CONSUMER: Migration marked as completed in checkpoint")
                     break
 
                 batch_number = batch["batch_number"]
                 records = batch["records"]
                 next_offset = batch["next_offset"]
+                fetch_time    = batch.get("fetch_time", 0)
+                transform_time = batch.get("transform_time", 0)
+                enqueue_time  = batch.get("enqueue_time", time.time())
                 records_count = len(records)
 
+                queue_wait_time = time.time() - enqueue_time
+
                 logger.info(f"CONSUMER: upserting batch {batch_number} ({records_count} records)")
-                t0 = time.time()
+                upsert_start = time.time()
                 success = await self.async_upsert_records(records)
-                elapsed = time.time() - t0
+                upsert_time = time.time() - upsert_start
 
                 if success:
                     self.checkpoint.update(batch_number, records_count, next_offset)
                     self.stats[UPSERTED_KEY] += records_count
                     self.stats[BATCHES_PROCESSED_KEY] += 1
                     pbar.update(records_count)
-                    throughput = records_count / elapsed if elapsed > 0 else 0
-                    logger.info(
-                        f"CONSUMER: batch {batch_number} ✓ — "
-                        f"{records_count} records in {elapsed:.2f}s "
-                        f"({throughput:.0f} rec/s)"
-                    )
                     queue.task_done()
+                    throughput = records_count / upsert_time if upsert_time > 0 else 0
+                    total_time = fetch_time + transform_time + queue_wait_time + upsert_time
+                    logger.info(
+                        f"[Batch {batch_number}]  {records_count} records | "
+                        f"fetch={fetch_time:.2f}s | "
+                        f"transform={transform_time:.2f}s | "
+                        f"queue_wait={queue_wait_time:.2f}s | "
+                        f"upsert={upsert_time:.2f}s | "
+                        f"total={total_time:.2f}s | "
+                        f"throughput={throughput:.1f} rec/s"
+                    )
                 else:
                     self.stats[FAILED_KEY] += records_count
                     logger.error(f"CONSUMER: batch {batch_number} ✗ — failed after retries")
@@ -755,6 +837,15 @@ class AsyncHybridMilvusToEndeeMigrator:
         Create queue + stop event, run producer and consumer concurrently.
         _stop_event created HERE — must be inside a running event loop.
         """
+        # Guard against re-running a completed migration
+        if self.checkpoint.is_completed():
+            logger.warning("=" * 80)
+            logger.warning("Previous migration is already COMPLETE.")
+            logger.warning(f"Already migrated: {self.checkpoint.get_processed_count()} records.")
+            logger.warning("Use --clear_checkpoint to re-run.")
+            logger.warning("=" * 80)
+            return
+
         logger.info("=" * 80)
         logger.info("ASYNC MILVUS → ENDEE MIGRATION  (producer-consumer)")
         logger.info("=" * 80)
@@ -764,6 +855,7 @@ class AsyncHybridMilvusToEndeeMigrator:
         logger.info(f"Upsert size: {self.upsert_batch_size}")
         logger.info(f"Queue size : {self.max_queue_size}")
         logger.info("=" * 80)
+
 
         if self.checkpoint.get_processed_count() > 0:
             logger.info("RESUMING from checkpoint:")
@@ -911,7 +1003,9 @@ def main():
     parser.add_argument("--checkpoint_file", default=os.getenv("CHECKPOINT_FILE", "./migration_checkpoint.json"))
     parser.add_argument("--clear_checkpoint", action="store_true",
                         default=os.getenv("CLEAR_CHECKPOINT", "false").lower() == "true")  # BUG 7 fix
-
+    parser.add_argument("--precision", default=os.getenv("PRECISION", None),
+                    help="Vector precision override (float32/float16/int8/int16/binary). "
+                         "If not set, auto-detected from source DB, fallback to INT16.")
     # Misc
     parser.add_argument("--debug", action="store_true",
                         default=os.getenv("DEBUG", "false").lower() == "true")
@@ -920,6 +1014,16 @@ def main():
 
     # if args.debug:
     #     logging.getLogger().setLevel(logging.DEBUG)
+    if args.precision is not None:
+        if args.precision == "":
+            precision=None
+        else:
+            precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
+            if precision is None:
+                logger.error(f"Invalid precision value: '{args.precision}'. "
+                            f"Valid options: {list(PRECISION_STR_TO_ENDEE.keys())}")
+                sys.exit(1)
+        args.precision = precision
 
     migrator = AsyncHybridMilvusToEndeeMigrator(
         milvus_url=args.source_url,
@@ -938,6 +1042,7 @@ def main():
         checkpoint_file=args.checkpoint_file,
         is_multivector=args.is_multivector,
         max_queue_size=args.max_queue_size,
+        precision=args.precision
     )
 
     if args.clear_checkpoint:
