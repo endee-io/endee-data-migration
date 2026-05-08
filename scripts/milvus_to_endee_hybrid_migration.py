@@ -46,6 +46,53 @@ PRECISION_STR_TO_ENDEE = {
     "int16":   Precision.INT16,
     "binary":  Precision.BINARY2,
 }
+PRECISION_RANK = {
+    Precision.BINARY2:  0,
+    Precision.INT8:     1,
+    Precision.INT16:    2,
+    Precision.FLOAT16:  3,
+    Precision.FLOAT32:  4,
+}
+
+PRECISION_NAMES = {
+    Precision.BINARY2:  "binary",
+    Precision.INT8:     "int8",
+    Precision.INT16:    "int16",
+    Precision.FLOAT16:  "float16",
+    Precision.FLOAT32:  "float32",
+}
+
+def validate_precision_downgrade(user_precision: Any, source_precision: Any) -> None:
+    if user_precision not in set(PRECISION_STR_TO_ENDEE.values()):
+        raise ValueError(
+            f"Precision '{user_precision}' is not supported by Endee.\n"
+            f"Supported: {list(PRECISION_STR_TO_ENDEE.keys())}"
+        )
+    source_rank = PRECISION_RANK.get(source_precision)
+    if source_rank is None:
+        logger.warning(
+            f"Source precision could not be detected (got '{source_precision}').\n"
+            f"Skipping downgrade check. Proceeding with '{PRECISION_NAMES.get(user_precision)}'.\n"
+            "If incompatible, Endee will reject the upsert and migration will exit with an error."
+        )
+        return
+    user_rank = PRECISION_RANK[user_precision]
+    if user_rank > source_rank:
+        valid_choices = ", ".join(
+            PRECISION_NAMES[p]
+            for p in PRECISION_RANK
+            if PRECISION_RANK[p] <= source_rank and p in set(PRECISION_STR_TO_ENDEE.values())
+        )
+        raise ValueError(
+            f"Precision upgrade is not allowed.\n"
+            f"  Source precision : {PRECISION_NAMES[source_precision]}\n"
+            f"  Requested        : {PRECISION_NAMES[user_precision]}\n"
+            f"Valid choices for this source: {valid_choices}"
+        )
+    logger.info(
+        f"Precision check passed: "
+        f"{PRECISION_NAMES[source_precision]} (source) → {PRECISION_NAMES[user_precision]} (target)"
+    )
 
 
 
@@ -207,6 +254,7 @@ class AsyncHybridMilvusToEndeeMigrator:
         self.milvus_client: Optional[MilvusClient] = None
         self.endee_client: Optional[Endee] = None
         self.endee_index = None
+        self.producer_failed = False
         
         # Statistics
         self.stats = {
@@ -378,9 +426,10 @@ class AsyncHybridMilvusToEndeeMigrator:
                     # Priority: user-provided (env/CLI) > metadata > INT16 default
                     if self.precision is None:
                         self.precision = precision
-                        logger.info(f"  Precision: auto-detected from metadata → {self.precision}")
+                        logger.info(f"  Precision: auto-detected → {PRECISION_NAMES.get(self.precision)}")
                     else:
-                        logger.info(f"  Precision: user-specified via env/CLI → {self.precision}")
+                        validate_precision_downgrade(self.precision, precision)
+                        logger.info(f"  Precision: user-specified → {PRECISION_NAMES.get(self.precision)}")
                 logger.info(f"✓ Dense Vector Field: '{name}' [{ftype}, dim={dim}, precision={self.precision}]")
 
             elif ftype in ["SPARSE_FLOAT_VECTOR", DataType.SPARSE_FLOAT_VECTOR]:
@@ -664,6 +713,8 @@ class AsyncHybridMilvusToEndeeMigrator:
             )
         except Exception as e:
             logger.error(f"PRODUCER: Failed to create iterator: {e}")
+            self.producer_failed = True   # ← track failure for report
+            self._stop_event.set()        # ← prevent consumer marking completed
             await queue.put(None)
             return
 
@@ -959,11 +1010,13 @@ class AsyncHybridMilvusToEndeeMigrator:
             logger.info("  Other fields → filter / meta")
         logger.info("=" * 80)
         if self.interrupted:
-            logger.info("Progress saved. Run again to resume from checkpoint.")
+            logger.warning("MIGRATION INTERRUPTED")
+        elif self.producer_failed:
+            logger.error("MIGRATION FAILED — PRODUCER COULD NOT START (collection may be recovering)")
         elif self.stats[FAILED_KEY] > 0:
-            logger.warning("Migration had errors. Check logs and retry.")
+            logger.warning("MIGRATION COMPLETED WITH ERRORS")
         else:
-            logger.info("Migration successful!")
+            logger.info("MIGRATION COMPLETED SUCCESSFULLY")
         logger.info("=" * 80)
 
 
@@ -1004,8 +1057,7 @@ def main():
     parser.add_argument("--clear_checkpoint", action="store_true",
                         default=os.getenv("CLEAR_CHECKPOINT", "false").lower() == "true")  # BUG 7 fix
     parser.add_argument("--precision", default=os.getenv("PRECISION", None),
-                    help="Vector precision override (float32/float16/int8/int16/binary). "
-                         "If not set, auto-detected from source DB, fallback to INT16.")
+                    help="Vector precision override (float32/float16/int8/int16/binary).")
     # Misc
     parser.add_argument("--debug", action="store_true",
                         default=os.getenv("DEBUG", "false").lower() == "true")
@@ -1016,14 +1068,19 @@ def main():
     #     logging.getLogger().setLevel(logging.DEBUG)
     if args.precision is not None:
         if args.precision == "":
-            precision=None
-        else:
-            precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
-            if precision is None:
-                logger.error(f"Invalid precision value: '{args.precision}'. "
-                            f"Valid options: {list(PRECISION_STR_TO_ENDEE.keys())}")
-                sys.exit(1)
+            logger.warning("Precision not set, check environment file and set Precision")
+            sys.exit(1)
+        precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
+        if precision is None:
+            logger.error(
+                f"Invalid precision value: '{args.precision}'. "
+                f"Valid options: {list(PRECISION_STR_TO_ENDEE.keys())}"
+            )
+            sys.exit(1)
         args.precision = precision
+    else:
+        logger.warning("Precision not set, check environment file and set Precision")
+        sys.exit(1)
 
     migrator = AsyncHybridMilvusToEndeeMigrator(
         milvus_url=args.source_url,
