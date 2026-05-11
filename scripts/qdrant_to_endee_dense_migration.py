@@ -450,7 +450,7 @@ class SimpleQdrantToEndeeMigrator:
                 else:
                     raise ValueError(f"Invalid binary quantization encoding: {encoding}")
             else:
-                endee_precision = Precision.FLOAT32
+                endee_precision = Precision.INT16
         else:
             endee_precision = Precision.FLOAT32
 

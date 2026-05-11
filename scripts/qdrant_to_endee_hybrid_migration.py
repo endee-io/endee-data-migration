@@ -121,6 +121,10 @@ class MigrationCheckpoint:
         self.data[BATCH_NUMBER_KEY] = batch_number
         self.data[LAST_OFFSET_KEY] = offset  # saves None explicitly when migration finishes
         self.save()
+
+    def is_completed(self) -> bool:
+        return self.data.get(COMPLETED_KEY, False)
+
     
     def mark_completed(self):
         self.data[COMPLETED_KEY] = True
@@ -503,7 +507,7 @@ class QdrantHybridToEndeeMigrator:
                 else:
                     raise ValueError(f"Invalid binary quantization encoding: {encoding}")
             else:
-                endee_precision = Precision.FLOAT32
+                endee_precision = Precision.INT16
         else:
             # KEEP FLOAT32 BECAUSE IF KEPT INT16 & NO PRECISION GET FROM SOURCE AND USER WANT IN FLOAT16 OR 32 BUT CAN'T SINCE IT WILL COMPARE WITH INT16
             endee_precision = Precision.FLOAT32

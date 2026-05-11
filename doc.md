@@ -14,7 +14,7 @@ Migrate vector data from **Qdrant** or **Milvus** into **Endee**. The tool ships
 | Source Collection | Source DB collection must be present |
 | Services Reachable |Make sure both Endee and Source DB services are up and reachable from machine where migration script will run.
 | Source & Endee Server | Both Source and Endee should run on different servers |
-
+| Migration Script Server | If migration & endee running on same server and in containers both should be on same network |
 
 ---
 
