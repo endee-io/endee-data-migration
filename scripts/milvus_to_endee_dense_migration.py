@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 MILVUS_DTYPE_TO_ENDEE_PRECISION = {
     DataType.FLOAT_VECTOR:    Precision.FLOAT32,   # 32-bit float
     DataType.FLOAT16_VECTOR:  Precision.FLOAT16,   # 16-bit half precision
-    # DataType.BFLOAT16_VECTOR: Precision.FLOAT16,   # bfloat16 → closest Endee match
+    DataType.BFLOAT16_VECTOR: Precision.FLOAT16,   # bfloat16 → closest Endee match
     DataType.BINARY_VECTOR:   Precision.BINARY2,    # binary
 }
 # Also handle string versions just in case
@@ -193,6 +193,7 @@ class SimpleMilvusToEndeeMigrator:
         self.endee_index = None
 
         self.vector_field_type = None
+        self.producer_failed = False
         
         # Statistics
         self.stats = {
@@ -600,6 +601,8 @@ class SimpleMilvusToEndeeMigrator:
             )
         except Exception as e:
             logger.error(f"PRODUCER: Failed to create iterator: {e}")
+            self.producer_failed = True   # ← add this too
+            self._stop_event.set()   # ← signals consumer this is an error, not natural end
             await queue.put(None)
             return
 
@@ -894,11 +897,13 @@ class SimpleMilvusToEndeeMigrator:
             logger.info("="*80)
         
         if self.interrupted:
-            logger.info("Progress saved. Run again to resume from checkpoint.")
+            logger.warning("MIGRATION INTERRUPTED")
+        elif self.producer_failed:
+            logger.error("MIGRATION FAILED — PRODUCER COULD NOT START (collection may be recovering)")
         elif self.stats[FAILED_KEY] > 0:
-            logger.warning("Migration had errors. Check logs and retry.")
+            logger.warning("MIGRATION COMPLETED WITH ERRORS")
         else:
-            logger.info("Migration successful!")
+            logger.info("MIGRATION COMPLETED SUCCESSFULLY")
         logger.info("="*80)
 
     def migrate(self):
@@ -967,6 +972,7 @@ def main():
     if args.precision is not None:
         if args.precision == "":
             precision=None
+            logger.error(f"Precision can't be ")
         else:
             precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
             if precision is None:

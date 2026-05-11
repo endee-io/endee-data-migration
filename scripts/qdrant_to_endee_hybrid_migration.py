@@ -30,7 +30,51 @@ PRECISION_STR_TO_ENDEE = {
     "int16":   Precision.INT16,
     "binary":  Precision.BINARY2,
 }
+PRECISION_RANK = {
+    Precision.BINARY2:  0,
+    Precision.INT8:     1,
+    Precision.INT16:    2,
+    Precision.FLOAT32:  3,
+}
 
+PRECISION_NAMES = {
+    Precision.BINARY2:  "binary",
+    Precision.INT8:     "int8",
+    Precision.INT16:    "int16",
+    Precision.FLOAT32:  "float32",
+}
+
+def validate_precision_downgrade(user_precision: Any, source_precision: Any) -> None:
+    if user_precision not in set(PRECISION_STR_TO_ENDEE.values()):
+        raise ValueError(
+            f"Precision '{user_precision}' is not supported by Endee.\n"
+            f"Supported: {list(PRECISION_STR_TO_ENDEE.keys())}"
+        )
+    source_rank = PRECISION_RANK.get(source_precision)
+    if source_rank is None:
+        logger.warning(
+            f"Source precision could not be detected (got '{source_precision}').\n"
+            f"Skipping downgrade check. Proceeding with '{PRECISION_NAMES.get(user_precision)}'.\n"
+            "If incompatible, Endee will reject the upsert and migration will exit with an error."
+        )
+        return
+    user_rank = PRECISION_RANK[user_precision]
+    if user_rank > source_rank:
+        valid_choices = ", ".join(
+            PRECISION_NAMES[p]
+            for p in PRECISION_RANK
+            if PRECISION_RANK[p] <= source_rank and p in set(PRECISION_STR_TO_ENDEE.values())
+        )
+        raise ValueError(
+            f"Precision upgrade is not allowed.\n"
+            f"  Source precision : {PRECISION_NAMES[source_precision]}\n"
+            f"  Requested        : {PRECISION_NAMES[user_precision]}\n"
+            f"Valid choices for this source: {valid_choices}"
+        )
+    logger.info(
+        f"Precision check passed: "
+        f"{PRECISION_NAMES[source_precision]} (source) → {PRECISION_NAMES[user_precision]} (target)"
+    )
 
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
@@ -77,6 +121,10 @@ class MigrationCheckpoint:
         self.data[BATCH_NUMBER_KEY] = batch_number
         self.data[LAST_OFFSET_KEY] = offset  # saves None explicitly when migration finishes
         self.save()
+
+    def is_completed(self) -> bool:
+        return self.data.get(COMPLETED_KEY, False)
+
     
     def mark_completed(self):
         self.data[COMPLETED_KEY] = True
@@ -461,12 +509,14 @@ class QdrantHybridToEndeeMigrator:
             else:
                 endee_precision = Precision.INT16
         else:
-            endee_precision = Precision.INT16
+            # KEEP FLOAT32 BECAUSE IF KEPT INT16 & NO PRECISION GET FROM SOURCE AND USER WANT IN FLOAT16 OR 32 BUT CAN'T SINCE IT WILL COMPARE WITH INT16
+            endee_precision = Precision.FLOAT32
 
         # User-specified precision overrides auto-detection
         if self.precision is not None:
-            logger.info(f"  Precision: user-specified: {self.precision}")
+            validate_precision_downgrade(self.precision, endee_precision)
             endee_precision = self.precision
+            logger.info(f"  Precision: user-specified: {PRECISION_NAMES[endee_precision]}")
         else:
             logger.info(f"  Precision: auto-detected: {endee_precision}")
         
@@ -815,8 +865,7 @@ def main():
     parser.add_argument(
         "--precision",
         default=os.getenv("PRECISION", None),
-        help="Vector precision override (float32/int8/int16/binary). "
-             "If not set, auto-detected from Qdrant quantization config, fallback to INT16."
+        help="Vector precision override (float32/int8/int16/binary)."
     )
 
 
@@ -829,7 +878,8 @@ def main():
 
     if args.precision is not None:
         if args.precision == "":
-            precision = None
+            logger.warning("Precision not set, check environment file and set Precision")
+            sys.exit(1)
         else:
             precision = PRECISION_STR_TO_ENDEE.get(args.precision.lower())
             if precision is None:
@@ -839,6 +889,9 @@ def main():
                 )
                 sys.exit(1)
         args.precision = precision
+    else:
+        logger.warning("Precision not set, check environment file and set Precision")
+        sys.exit(1)
     
     # Create migrator
     migrator = QdrantHybridToEndeeMigrator(
