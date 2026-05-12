@@ -863,10 +863,10 @@ def main():
     parser.add_argument("--target_collection", default=os.getenv("TARGET_COLLECTION"), help="Endee index name")
     
     # Performance arguments
-    parser.add_argument("--batch_size", type=int, default=DEFAULT_FETCH_BATCH_SIZE, 
-                       help="Fetch batch size (default: 1000)")
-    parser.add_argument("--upsert_size", type=int, default=DEFAULT_UPSERT_BATCH_SIZE, 
-                       help="Upsert batch size (default: 1000)")
+    parser.add_argument("--batch_size", type=int, default=int(os.getenv("BATCH_SIZE", DEFAULT_FETCH_BATCH_SIZE)),
+                   help="Fetch batch size (default: 1000)")
+    parser.add_argument("--upsert_size", type=int, default=int(os.getenv("UPSERT_SIZE", DEFAULT_UPSERT_BATCH_SIZE)),
+                   help="Upsert batch size (default: 1000)")
     
     # Connection arguments
 

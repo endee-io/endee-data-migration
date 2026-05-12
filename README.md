@@ -1,312 +1,160 @@
-# Endee Migration Tool
+# Endee Migration Tool - Documentation
 
-Migrate vector collections from **Qdrant** or **Milvus** to **Endee** using a Dockerized producer-consumer pipeline with checkpoint resume support.
+Migrate vector data from **Qdrant** or **Milvus** into **Endee**. The tool ships as a Docker image and supports dense-only and hybrid (dense + sparse) collections.
 
 ---
 
-## Supported Migrations
 
-| Migration Type | Command |
+
+## Setup
+### Prerequisites
+| Requirement | Details |
 |---|---|
-| Qdrant (Dense) → Endee | `qdrant-to-endee-dense` |
-| Qdrant (Hybrid: Dense + Sparse) → Endee | `qdrant-to-endee-hybrid` |
-| Milvus (Dense) → Endee | `milvus-to-endee-dense` |
-| Milvus (Hybrid: Dense + Sparse) → Endee | `milvus-to-endee-hybrid` |
+| API access | API key should have data access permission of Collection or Index |
+| Source Collection | Source DB collection must be present |
+| Services Reachable |Make sure both Endee and Source DB services are up and reachable from machine where migration script will run.
+| Source & Endee Server | Both Source and Endee should run on different servers |
 
 ---
 
-## Project Structure
 
-```
-.
-├── cmd.sh                          # Build and run script
-├── .env                            # Configuration (copy from .env.example)
-├── data/
-│   └── checkpoints/               # Checkpoint files (auto-created, mount as volume)
-├── scripts/
-│   ├── qdrant_to_endee_dense_migration.py
-│   ├── qdrant_to_endee_hybrid_migration.py
-│   ├── milvus_to_endee_dense_migration.py
-│   └── milvus_to_endee_hybrid_migration.py
-├── entrypoint.sh                   # Docker entrypoint
-└── Dockerfile
+### Setup Steps
+
+**Step 1 - Clone Migration Script:**
+```bash
+git clone https://github.com/endee-io/endee-data-migration.git
+cd endee-data-migration/
 ```
 
----
-
-## Quick Start
-
-### 1. Configure your `.env` file
-
-Copy and edit the environment file:
-
+**Step 2 - Create .env from .env.example:**
 ```bash
 cp .env.example .env
 ```
 
-Set your source database, target Endee credentials, and migration type. See [Configuration Reference](#configuration-reference) below for all options.
-
-### 2. Run the migration
-
-Run `cmd.sh`:
+**Step 3 - Update .env file:**
 ```bash
-bash cmd.sh
-```
-
----
-
-## Configuration Reference
-
-All settings can be provided via `.env` file or as environment variables passed to Docker.
-
-### Migration Type
-
-```env
-# Choose one:
-# qdrant-to-endee-dense
-# qdrant-to-endee-hybrid
-# milvus-to-endee-dense
-# milvus-to-endee-hybrid
-MIGRATION_TYPE=qdrant-to-endee-dense
-```
-
-### Source — Qdrant
-
-```env
-SOURCE_URL=http://your-qdrant-host
-SOURCE_PORT=6333
-SOURCE_API_KEY=                      # Leave empty if no auth
-SOURCE_COLLECTION=your_collection
-USE_HTTPS=false
-```
-
-### Source — Milvus
-
-```env
-SOURCE_URL=http://your-milvus-host
+# .env
+MIGRATION_TYPE=milvus-to-endee-dense
+SOURCE_URL=http://<milvus-server-ip>
 SOURCE_PORT=19530
-SOURCE_API_KEY=your_milvus_token     # Leave empty if no auth
-SOURCE_COLLECTION=your_collection
-IS_MULTIVECTOR=false
+SOURCE_COLLECTION=my_collection # SOURCE DATABASE COLLECTION NAME FROM WHERE DATA NEEDS TO MIGRATE
+TARGET_URL=http://<endee-server-ip>:8080 # IP OF ENDEE SERVER RUNNING ON
+TARGET_API_KEY=your-endee-api-key # IF USING ENDEE DEV SERVER GET THE API KEY (NO NEED TO SET TARGET URL IN THAT CASE )
+TARGET_COLLECTION=my_index # ENDEE INDEX NAME
+CLEAR_CHECKPOINT=true # FALSE IF YOU WANT TO RESUME THE MIGRATION
+FILTER_FIELDS=field1,field2 # ADD FILTER_FIELDS ONLY IF YOU WANT FIELDS TO BE IN ENDEE FILTER AND NOT IN META
+PRECISION=INT16 
 ```
 
-### Target — Endee
 
-```env
-TARGET_URL=http://your-endee-host:8080   # Omit for Endee Cloud
-TARGET_API_KEY=your_endee_api_key
-TARGET_COLLECTION=your_index_name
+**Step 4 - Make scripts executable:**
+```bash
+chmod +x entrypoint.sh
+chmod +x cmd.sh
 ```
 
-### Performance
-
-```env
-BATCH_SIZE=1000        # Records fetched per batch from source
-UPSERT_SIZE=1000       # Records upserted per chunk to Endee
-MAX_QUEUE_SIZE=5       # Max batches buffered in memory between producer and consumer
-```
-
-### Index Parameters (Milvus only — auto-detected from schema)
-
-```env
-# These are read automatically from Milvus collection schema.
-# Override only if needed:
-# SPACE_TYPE=cosine    # cosine | l2 | ip
-# M=16
-# EF_CONSTRUCT=128
-```
-
-### Checkpoint / Resume
-
-```env
-CHECKPOINT_FILE=/app/data/checkpoints/migration.json
-# CLEAR_CHECKPOINT=true    # Uncomment to start fresh
-```
-
-### Filter Fields
-
-```env
-# Comma-separated list of payload fields to use as Endee filter fields.
-# All other fields go to meta.
-# Endee filter fields must be scalar types (str, int, float, bool).
-# Lists and dicts must go to meta — do not include them here.
-FILTER_FIELDS=company,region,sector,document_type
-```
-
-### Debug
-
-```env
-DEBUG=false    # Set true for verbose logging
-```
-
----
-
-## Full `.env` Example
-
-```env
-# ── Migration ────────────────────────────────────────────────────
-MIGRATION_TYPE=qdrant-to-endee-hybrid
-
-# ── Source (Qdrant) ──────────────────────────────────────────────
-SOURCE_URL=
-SOURCE_PORT=6333
-SOURCE_API_KEY=
-SOURCE_COLLECTION=
-USE_HTTPS=false
-
-# ── Target (Endee) ───────────────────────────────────────────────
-TARGET_API_KEY=your_endee_api_key
-TARGET_COLLECTION=my_endee_index
-
-# ── Performance ──────────────────────────────────────────────────
-BATCH_SIZE=1000
-UPSERT_SIZE=1000
-MAX_QUEUE_SIZE=5
-
-# ── Filter fields ────────────────────────────────────────────────
-FILTER_FIELDS=company,region,sector,document_type,page_number
-
-# ── Checkpoint ───────────────────────────────────────────────────
-CHECKPOINT_FILE=/app/data/checkpoints/migration.json
-
-# ── Debug ────────────────────────────────────────────────────────
-DEBUG=false
-```
-
----
-
-## cmd.sh Reference
+**Step 5 - Start Migration:**
 
 ```bash
-#!/bin/bash
-docker network create vector-net 2>/dev/null || true
-docker build -t vector-migration:latest .
-docker compose up --build
+./cmd.sh
 ```
+
+Make sure:
+- Port `6333` (Qdrant) or `19530` (Milvus) is open on the source server.
+- The Endee API port is open on the Endee server.
+- The migration container has outbound access to both.
 
 ---
 
-## Checkpoint & Resume
 
-Migration progress is saved after every successfully upserted batch. If the migration is interrupted for any reason (network error, Ctrl+C, container restart), simply rerun the same command — it will resume from where it left off automatically.
+## Running the Migration
 
-```bash
-# Resume from last checkpoint (default — just rerun):
-bash cmd.sh
+### Available Migration Types
 
-# Start fresh (discard checkpoint):
-# Set in .env:
-CLEAR_CHECKPOINT=true
-```
-
-The checkpoint file is stored at `CHECKPOINT_FILE` (default: `/app/data/checkpoints/migration.json`). Since `/app/data` is mounted as a volume, the checkpoint persists across container restarts.
-
-**Checkpoint file example:**
-```json
-{
-  "processed_count": 50000,
-  "last_offset": "abc123-uuid-...",
-  "batch_number": 50
-}
-```
-
----
-
-## Filter Fields vs Meta Fields
-
-Endee has two payload buckets per record:
-
-| Bucket | Purpose | Allowed types |
+| Type | Source | Vector Mode |
 |---|---|---|
-| `filter` | Used for filtering search results | `str`, `int`, `float`, `bool` only |
-| `meta` | Stored metadata, not filterable | Any type including `list`, `dict` |
+| `milvus-to-endee-dense` | Milvus | Dense vectors only |
+| `milvus-to-endee-hybrid` | Milvus | Dense + sparse vectors |
+| `qdrant-to-endee-dense` | Qdrant | Dense vectors only |
+| `qdrant-to-endee-hybrid` | Qdrant | Named dense (`dense`) + sparse (`sparse_keywords`) vectors |
 
-**Important:** If any field in `FILTER_FIELDS` contains a `list` or `dict` value, Endee will reject the record with `MDBX_BAD_VALSIZE`. Always use scalar values in filter fields.
+Pass the type as the first argument to the container, or set `MIGRATION_TYPE` in your `.env`.
 
-```env
-# ✓ Safe — scalar fields
-FILTER_FIELDS=company,region,sector,page_number
+### Override precision manually
+| Item | Value / Options | When to use |
+|---|---|---|
+| Override setting | Set `PRECISION` in `.env` | Use this to override auto-detected precision |
+| Valid values | `FLOAT32`, `FLOAT16`, `INT16`, `INT8`, `BINARY` | Choose based on your accuracy and storage needs |
+| Recommended option | `INT16` | Good balance of accuracy and storage efficiency when source has no explicit quantization |
+| Full precision option | `FLOAT32` | Preserve full original precision |
 
-# ✗ Will fail — 'product' is a list in this dataset
-FILTER_FIELDS=company,product
-```
 
-If `FILTER_FIELDS` is empty, all payload fields go to `filter`. Fields with non-scalar values should always be excluded from `FILTER_FIELDS` and will automatically land in `meta`.
+### Checkpoint and Resume
+
+| Item | Details |
+|---|---|
+| Checkpoint behavior | The script saves progress to a JSON file after every successful batch. |
+| Resume behavior | If migration is interrupted (network error, container restart, manual stop), re-run the same command with `--clear_checkpoint=False` to continue from the last saved point. |
+| Checkpoint path (container) | `/app/data/checkpoints/migration.json` |
+| Checkpoint path (host) | `./data/checkpoints/migration.json` |
+| Volume mount required | `-v $(pwd)/data:/app/data` |
+
+### FILTER FIELDS
+| Source | Input fields | `FILTER_FIELDS` setting | Endee `filter` | Endee `meta` |
+|---|---|---|---|---|
+| Qdrant | Payload fields | Not set | Empty | All payload fields |
+| Milvus | Metadata fields | Not set | Empty | All metadata fields |
+| Qdrant / Milvus | Payload (Qdrant) / Metadata (Milvus) | Set (for example: `category,status,year`) | Only fields listed in `FILTER_FIELDS` | Remaining fields not listed in `FILTER_FIELDS` |
+---
+
+### Qdrant → Endee record field mapping
+
+
+| Qdrant concept | Endee field | Mapping |
+|---|---|---|
+| Point ID (primary key) | `id` | `str(point.id)` |
+| Dense vector | `vector` | `point.vector` from scroll (`with_vectors=True`). Expects a single dense vector; `--is_multivector` is rejected (script raises). |
+| Sparse vector | `sparse_indices`, `sparse_values` | Used in hybrid flow when sparse data is present; not used in dense-only flow. |
+| Payload | `filter`, `meta` | Keys listed in `FILTER_FIELDS` go to `filter`; every other payload key goes to `meta`. If `FILTER_FIELDS` is unset, the full payload goes to `meta` and `filter` is `{}`. |
 
 ---
 
-## Architecture
+### Milvus → Endee record field mapping
 
-Each migration runs a **producer-consumer pipeline** inside `asyncio`:
+Rows are built in `convert_records` in the Milvus migration scripts. Schema detection walks `describe_collection` fields: primary key, vector field(s), and everything else as metadata. Endee uses the same keys as in the Qdrant flow (`id`, `vector`, `filter`, `meta`, and for hybrid, `sparse_indices` / `sparse_values` when applicable).
 
-```
-migrate()                     ← sync setup: connect, detect schema, create index
-    └── asyncio.run(async_migrate())
-            ├── async_producer()   ← fetches batches from source into bounded queue
-            └── async_consumer()   ← reads from queue, upserts to Endee, saves checkpoint
-```
-
-- **Bounded queue** (`MAX_QUEUE_SIZE=5`) prevents memory overflow — producer pauses when queue is full.
-- **All blocking SDK calls** (Qdrant scroll, Milvus query, Endee upsert) run in `loop.run_in_executor()` so the event loop is never frozen.
-- **Parallel upsert** — chunks within a batch are upserted concurrently via `asyncio.gather()`.
-- **Exponential backoff retry** — failed chunks are retried up to 3 times (1s, 2s, 4s).
-- **Graceful shutdown** — `SIGINT`/`SIGTERM` (Ctrl+C or `docker stop`) saves checkpoint and exits cleanly.
+| Milvus concept | Endee field | Mapping |
+|---|---|---|
+| Primary key (`is_primary`) | `id` | `str(record[primary_key_field])` using the detected primary-key field name. |
+| Dense vector | `vector` | Value is read from the first detected dense vector field and passed through `decode_vector` (bytes/list handling per field type). Additional dense vector fields in the same collection are not written to Endee by these scripts. |
+| Sparse vector (`SPARSE_FLOAT_VECTOR`) | `sparse_indices`, `sparse_values` | Used in hybrid flow when sparse data exists. Sparse dict entries (index -> weight) are sorted and mapped to `sparse_indices` (ints) and `sparse_values` (floats). In dense-only flow, sparse fields are not used. |
+| Non-vector fields (metadata columns) | `filter`, `meta` | Only non-primary, non-vector schema fields are eligible (`other_fields_meta`). If `FILTER_FIELDS` is set, listed keys go to `filter` and remaining eligible keys go to `meta`; if unset, eligible fields go to `meta` and `filter` is `{}`. |
 
 ---
 
-## Troubleshooting
-
-### Migration hangs after a failure
-
-The consumer failed and the queue is full — the producer is blocked in `queue.put()`. Kill the container and rerun. The fix is to add a queue drain in the consumer's failure path (see source code comments).
-
-To debug a hang:
-```bash
-# Inside the container
-pip install py-spy
-py-spy dump --pid 1
-```
-
-### `MDBX_BAD_VALSIZE` error
-
-A filter field contains a non-scalar value (usually a `list`). Remove it from `FILTER_FIELDS` — it will go to `meta` instead.
-
-```env
-# If 'product' is a list:
-FILTER_FIELDS=company,region,sector   # ← remove 'product'
-```
-
-### `Cannot allocate memory` on index creation
-
-The Endee server is out of memory — too many indexes open. Delete unused indexes on the Endee server before retrying.
-
-```bash
-free -h          # check available RAM on Endee server
-docker stats     # check container memory usage
-```
-
-### Qdrant client version warning
-
-```
-UserWarning: Qdrant client version 1.16.2 is incompatible with server version 1.13.6
-```
-
-Downgrade the client to match your server version, or add `check_compatibility=False` to the `QdrantClient` constructor. Migration will still work in most cases despite the warning.
-
-### URL has trailing space
-
-```
-Failed to resolve 'your-host%20'
-```
-
-Check `TARGET_URL` or `SOURCE_URL` in `.env` for trailing whitespace.
-
+### Precision Milvus and Endee DataType Mapping
 ---
 
-## Requirements
+| Milvus DataType | Endee Precision | Notes |
+|---|---|---|
+| `FLOAT_VECTOR` | `FLOAT32` | Default 32-bit float vectors |
+| `FLOAT16_VECTOR` | `FLOAT16` | 16-bit half precision vectors |
+| `BFLOAT16_VECTOR` | `FLOAT16` | Mapped to closest supported Endee precision |
+| `BINARY_VECTOR` | `BINARY2` | Binary vectors |
+<!-- | no quantization config | `INT16` | Default precision | -->
 
-- Docker
-- Source database accessible from the Docker network (`--network vector-net` or host network)
-- Endee instance running and accessible
-- Sufficient disk space for checkpoint file (tiny — JSON, a few KB)
-- Sufficient RAM for `MAX_QUEUE_SIZE × BATCH_SIZE` records in memory at once
+### Precision Qdrant and Endee DataType Mapping
+
+| Qdrant Quantization Config | Endee Precision | Notes |
+|---|---|---|
+| `scalar` present | `INT8` | Qdrant scalar quantization is treated as int8 |
+| `binary` present, no `query_encoding`, no explicit `encoding` | `BINARY2` | Supported binary quantization path |
+| no quantization config | `INT16` | Default precision |
+| quantization present but none of `scalar`/`binary`/`product` | `INT16` | Fallback/default path |
+| `product` present | Not supported | Migration raises an error |
+| `binary` with `query_encoding` | Not supported | Asymmetric quantization raises an error |
+| `binary` with explicit `encoding` | Not supported | Invalid encoding raises an error |
+
+---
+Note: The script exits if quantization is not configured in the environment variables.
+

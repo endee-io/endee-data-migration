@@ -10,3 +10,4 @@ data/
 .env.local
 *.whl
 .vscode/*
+doc.md
