@@ -507,18 +507,37 @@ class SimpleQdrantToEndeeMigrator:
             logger.info(f"✓ Created index: {self.endee_index_name}")
     
     async def async_fetch_batch(self, offset: Optional[Any]) -> tuple:
-        """Async fetch batch from Qdrant"""
+        """Async fetch batch from Qdrant with retry logic"""
         loop = asyncio.get_running_loop()
-        # RUN IN SEPARATE THREAD USING EVENT LOOP EXECUTOR
-        points_batch, next_offset = await loop.run_in_executor(None, lambda: self.qdrant_client.scroll(
-            collection_name=self.qdrant_collection,
-            limit=self.fetch_batch_size,
-                offset=offset,
-                with_payload=True,
-                with_vectors=True
-            )
-        )
-        return points_batch, next_offset
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                points_batch, next_offset = await loop.run_in_executor(
+                    None,
+                    lambda: self.qdrant_client.scroll(
+                        collection_name=self.qdrant_collection,
+                        limit=self.fetch_batch_size,
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=True,
+                    )
+                )
+                return points_batch, next_offset
+
+            except Exception as e:
+                wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Fetch failed at offset {offset} "
+                        f"(attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"Fetch at offset {offset} failed after {max_retries} attempts: {e}"
+                    )
+                    raise
     
     def convert_records(self, points) -> list:
         """Convert Qdrant points to Endee format"""
