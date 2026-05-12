@@ -14,6 +14,8 @@ import os
 import dotenv
 import asyncio
 from constants import *
+from qdrant_client.http.models import Distance
+
 
 dotenv.load_dotenv()
 
@@ -43,6 +45,12 @@ PRECISION_NAMES = {
     Precision.INT16:    "int16",
     Precision.FLOAT32:  "float32",
 }
+QDRANT_TO_ENDEE_SPACE = {
+    Distance.COSINE: "cosine",
+    Distance.EUCLID: "l2",
+    Distance.DOT:    "ip",
+}
+
 
 def validate_precision_downgrade(user_precision: Any, source_precision: Any) -> None:
     if user_precision not in set(PRECISION_STR_TO_ENDEE.values()):
@@ -417,6 +425,19 @@ class QdrantHybridToEndeeMigrator:
         
         params =  collection_info.config.params
         vectors = params.vectors
+        # ── GUARD: reject dense-only collections in the hybrid script ──────────
+        # Dense-only collections have VectorParams (not a dict), and no sparse_vectors
+        sparse_vectors = params.sparse_vectors
+        is_dense_only = not isinstance(vectors, dict) and (
+            not sparse_vectors or not isinstance(sparse_vectors, dict) or len(sparse_vectors) == 0
+        )
+        if is_dense_only:
+            raise ValueError(
+                f"Collection '{self.qdrant_collection}' is a DENSE-ONLY collection.\n"
+                f"  vectors type : {type(vectors).__name__}\n"
+                f"  sparse_vectors : {sparse_vectors}\n"
+                f"  Use qdrant-to-endee-dense instead in env."
+            )
         # =========================================================================================
         if isinstance(vectors, dict):
             vectors_map = vectors
@@ -428,16 +449,30 @@ class QdrantHybridToEndeeMigrator:
         # =========================================================================================
         # SET DIMENSION, AND SPACE TYPE
         logger.info(f"collection_info.config.params.vectors: {collection_info.config.params}")
-        vectors_dimension = vectors['dense'].size
-        qdrant_space_type = vectors['dense'].distance
-        if qdrant_space_type == "Cosine":
+        # vectors_dimension = vectors['dense'].size
+        # qdrant_space_type = vectors['dense'].distance
+        dense_vector_config = vectors.get('dense')
+
+        if dense_vector_config is None:
+            # fallback: try to grab the first available vector config
+            dense_vector_config = next(iter(vectors.values()), None)
+
+        if dense_vector_config is None:
+            raise ValueError(
+                f"No dense vector config found in collection. "
+                f"Available vectors: {list(vectors.keys())}"
+            )
+
+        vectors_dimension = dense_vector_config.size
+        qdrant_space_type = dense_vector_config.distance
+
+        endee_space_type = QDRANT_TO_ENDEE_SPACE.get(qdrant_space_type)
+        if endee_space_type is None:
+            logger.warning(
+                f"Unknown space type '{qdrant_space_type}', defaulting to cosine"
+            )
             endee_space_type = "cosine"
-        elif qdrant_space_type == "Euclid":
-            endee_space_type = "l2"
-        elif qdrant_space_type == "Dot":
-            endee_space_type = "ip"
-        else:
-            raise ValueError(f"Invalid space type: {qdrant_space_type}")
+
         sparse_dimension = DEFAULT_SPARSE_DIMENSION
         # =========================================================================================
 
@@ -545,6 +580,7 @@ class QdrantHybridToEndeeMigrator:
             self.endee_client.create_index(
                 name=self.endee_index_name,
                 dimension=config[DIMENSION_KEY],
+                space_type=config[SPACE_TYPE_KEY],
                 sparse_model=DEFAULT_SPARSE_MODEL,
                 M=config[M_KEY],
                 ef_con=config[EF_CONSTRUCT_KEY],

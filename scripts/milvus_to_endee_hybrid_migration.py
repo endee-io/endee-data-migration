@@ -203,6 +203,7 @@ class AsyncHybridMilvusToEndeeMigrator:
         endee_api_key: str,
         endee_index: str,
         precision: str,
+        milvus_db:str,
         milvus_port: int = DEFAULT_MILVUS_PORT,
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
         upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
@@ -217,6 +218,7 @@ class AsyncHybridMilvusToEndeeMigrator:
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
+        self.milvus_db = milvus_db
         self.milvus_collection = milvus_collection
         self.milvus_port = milvus_port
         self.endee_url = endee_url
@@ -288,7 +290,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                 if uri.startswith("localhost") or uri.replace(".", "").replace(":", "").isdigit():
                     uri = f"http://{uri}:{self.milvus_port}"
                     logger.info(f"Added protocol to URI: {uri}")
-            self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
+            self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token, db_name=self.milvus_db)
             # self.endee_client.list_indexes()
             logger.info("✓ Connected to Milvus")
         except Exception as e:
@@ -392,7 +394,7 @@ class AsyncHybridMilvusToEndeeMigrator:
             if is_primary:
                 id_field = {"name": name, "type": ftype}
                 self.id_field_name = name
-                logger.info(f"✓ ID Field (Primary Key): '{name}' [{ftype}]")
+                logger.info(f"ID Field (Primary Key): '{name}' [{ftype}]")
 
             elif ftype in [DataType.BFLOAT16_VECTOR, "BFLOAT16_VECTOR"]:
                 raise ValueError(
@@ -404,7 +406,7 @@ class AsyncHybridMilvusToEndeeMigrator:
                 "FLOAT_VECTOR", "FLOAT16_VECTOR", "BINARY_VECTOR",
                 DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR, DataType.BINARY_VECTOR,
             ]:
-                index_info = self.milvus_client.describe_index(self.milvus_collection, name)
+                index_info = self.milvus_client.describe_index(self.milvus_collection, name) or {}
                 params = field.get("params", {})
                 dim = params.get("dim") or field.get("dim")
                 precision = (
@@ -458,6 +460,16 @@ class AsyncHybridMilvusToEndeeMigrator:
             "other_fields_meta": other_fields,
             "is_hybrid": is_hybrid,
         }
+        # ── GUARD: reject dense-only collections in the hybrid script ──────
+        if not sparse_vector_fields:
+            raise ValueError(
+                f"Collection '{self.milvus_collection}' is a DENSE-ONLY collection.\n"
+                f"  Dense fields detected  : {[f['name'] for f in dense_vector_fields]}\n"
+                f"  Sparse fields detected : none\n"
+                f"  Use qdrant-to-endee-dense instead in env."
+            )
+        # ───────────────────────────────────────────────────────────────────
+
 
         if not self.id_field_name:
             raise ValueError("No primary key field found in collection")
@@ -1058,6 +1070,7 @@ def main():
                         default=os.getenv("CLEAR_CHECKPOINT", "false").lower() == "true")  # BUG 7 fix
     parser.add_argument("--precision", default=os.getenv("PRECISION", None),
                     help="Vector precision override (float32/float16/int8/int16/binary).")
+    parser.add_argument("--source_db", default=os.getenv("SOURCE_DB", "default"), help="Milvus database name (default: 'default')")
     # Misc
     parser.add_argument("--debug", action="store_true",
                         default=os.getenv("DEBUG", "false").lower() == "true")
@@ -1085,6 +1098,7 @@ def main():
     migrator = AsyncHybridMilvusToEndeeMigrator(
         milvus_url=args.source_url,
         milvus_token=args.source_api_key,
+        milvus_db=args.source_db,
         milvus_collection=args.source_collection,
         milvus_port=args.source_port,
         filter_fields=args.filter_fields,

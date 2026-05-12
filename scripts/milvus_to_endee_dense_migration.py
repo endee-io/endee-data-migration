@@ -26,6 +26,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("pymilvus").setLevel(logging.CRITICAL)
 
 MILVUS_DTYPE_TO_ENDEE_PRECISION = {
     DataType.FLOAT_VECTOR:    Precision.FLOAT32,   # 32-bit float
@@ -150,6 +151,7 @@ class SimpleMilvusToEndeeMigrator:
         endee_api_key: str,
         endee_index: str,
         precision: str,
+        milvus_db:str,
         milvus_port: int = DEFAULT_MILVUS_PORT,
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
         upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
@@ -163,6 +165,7 @@ class SimpleMilvusToEndeeMigrator:
     ):
         self.milvus_url = milvus_url
         self.milvus_token = milvus_token
+        self.milvus_db = milvus_db
         self.milvus_collection = milvus_collection
         self.milvus_port = milvus_port
         self.endee_url = endee_url
@@ -208,6 +211,67 @@ class SimpleMilvusToEndeeMigrator:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
     
+    def _load_collection(self):
+        """Ensure collection is loaded into memory before querying."""
+        from pymilvus import MilvusException
+        logger.info(f"Loading collection '{self.milvus_collection}' into memory...")
+        try:
+            load_state = self.milvus_client.get_load_state(
+                collection_name=self.milvus_collection
+            )
+            state = load_state.get("state", "")
+            logger.info(f"  Current load state: {state}")
+
+            if str(state) == "Loaded":
+                logger.info("Collection already loaded")
+                return
+
+            self.milvus_client.load_collection(
+                collection_name=self.milvus_collection
+            )
+            logger.info("  Load triggered — waiting for collection to be ready...")
+
+            timeout = 300
+            interval = 5
+            elapsed = 0
+            while elapsed < timeout:
+                time.sleep(interval)
+                elapsed += interval
+                load_state = self.milvus_client.get_load_state(
+                    collection_name=self.milvus_collection
+                )
+                state = str(load_state.get("state", ""))
+                logger.info(f"  Load state after {elapsed}s: {state}")
+                if state == "Loaded":
+                    logger.info("Collection loaded successfully")
+                    return
+
+            logger.error(
+                f"Collection '{self.milvus_collection}' did not load within {timeout}s. "
+                f"Last state: {state}"
+            )
+            sys.exit(1)
+
+        except MilvusException as e:
+            if "index not found" in str(e).lower():
+                logger.error(
+                    f"Collection '{self.milvus_collection}' has no vector index and cannot be loaded.\n"
+                    f"  You must build an index before migrating. Example:\n"
+                    f"    client.create_index(\n"
+                    f"      collection_name='{self.milvus_collection}',\n"
+                    f"      field_name='<your_vector_field>',\n"
+                    f"      index_params={{'metric_type': 'COSINE', 'index_type': 'HNSW', 'params': {{'M': 16, 'efConstruction': 128}}}}\n"
+                    f"    )\n"
+                    f"  Then re-run the migration."
+                )
+                sys.exit(1)
+
+            logger.error(
+                f"Failed to load collection '{self.milvus_collection}': {e}\n"
+                f"Make sure the Milvus has loaded collection"
+            )
+            sys.exit(1)
+    
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
         logger.warning(f"\n{'='*80}")
@@ -227,8 +291,8 @@ class SimpleMilvusToEndeeMigrator:
                     uri = f"http://{uri}:{self.milvus_port}"
                     logger.info(f"Added protocol to URI: {uri}")
             
-            self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token)
-            logger.info("✓ Connected to Milvus")
+            self.milvus_client = MilvusClient(uri=uri, token=self.milvus_token, db_name=self.milvus_db)
+            logger.info("Connected to Milvus")
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
     
@@ -247,7 +311,7 @@ class SimpleMilvusToEndeeMigrator:
             logger.info(f"Set Endee base URL: {url}")
 
         logger.info(f"{self.endee_client.list_indexes()}")
-        logger.info("✓ Connected to Endee")
+        logger.info("Connected to Endee")
     
     def decode_vector(self, raw_vector, field_type):
         """Decode Milvus vector bytes to float list for Endee"""
@@ -304,6 +368,7 @@ class SimpleMilvusToEndeeMigrator:
         vector_fields = []
         id_field = None
         other_fields = []
+        sparse_fields = []   # ← track sparse fields
         
         logger.info("FIELDS DETECTED:")
         logger.info("-" * 80)
@@ -321,6 +386,8 @@ class SimpleMilvusToEndeeMigrator:
                 }
                 self.id_field_name = field_name
                 logger.info(f"✓ ID Field (Primary Key): '{field_name}' [{field_type}]")
+            
+
 
             elif field_type in [DataType.BFLOAT16_VECTOR,'BFLOAT16_VECTOR']:
                 raise ValueError(
@@ -328,6 +395,11 @@ class SimpleMilvusToEndeeMigrator:
                     f"Endee does not support BFLOAT16 precision. "
                     f"Please convert your vectors to FLOAT32 or FLOAT16 before migrating."
                 )
+            
+            # ── GUARD: detect sparse vector field ──────────────────────────────
+            elif field_type in ['SPARSE_FLOAT_VECTOR', DataType.SPARSE_FLOAT_VECTOR]:
+                sparse_fields.append(field_name)
+                logger.info(f"  • Sparse Vector Field detected: '{field_name}' [{field_type}]")
 
             # Detect vector fields
             elif field_type in ['FLOAT_VECTOR', 'FLOAT16_VECTOR', 'BINARY_VECTOR',
@@ -396,7 +468,15 @@ class SimpleMilvusToEndeeMigrator:
             'vector_field_meta': vector_fields,
             'other_fields_meta': other_fields
         }
-
+        # ── GUARD: reject hybrid collections in the dense script ───────────────
+        if sparse_fields:
+            raise ValueError(
+                f"Collection '{self.milvus_collection}' is a HYBRID collection.\n"
+                f"  Sparse vector fields detected: {sparse_fields}\n"
+                f"  Dense vector fields detected: {[f['name'] for f in vector_fields]}\n"
+                f"  Use milvus-to-endee-hybrid instead in env."
+            )
+        # ───────────────────────────────────────────────────────────────────────
         if not self.id_field_name:
             raise ValueError("No primary key field found in collection")
         if not self.vector_field_name:
@@ -823,6 +903,7 @@ class SimpleMilvusToEndeeMigrator:
         
         # Setup connections
         self.connect_milvus()
+        self._load_collection()
         self.connect_endee()
         
         # Detect field names and dimensions from Milvus schema
@@ -899,7 +980,8 @@ class SimpleMilvusToEndeeMigrator:
         if self.interrupted:
             logger.warning("MIGRATION INTERRUPTED")
         elif self.producer_failed:
-            logger.error("MIGRATION FAILED — PRODUCER COULD NOT START (collection may be recovering)")
+            logger.error("MIGRATION FAILED — PRODUCER COULD NOT START")
+            sys.exit(1)          # ← exit with error code so docker/CI detects failure
         elif self.stats[FAILED_KEY] > 0:
             logger.warning("MIGRATION COMPLETED WITH ERRORS")
         else:
@@ -963,6 +1045,9 @@ def main():
                     help="Vector precision override (float32/float16/int8/int16/binary). "
                          "If not set, auto-detected from source DB, fallback to INT16.")
     
+    parser.add_argument("--source_db", default=os.getenv("SOURCE_DB", "default"), help="Milvus database name (default: 'default')")
+
+    
     args = parser.parse_args()
     
     # # Set debug level if requested
@@ -985,6 +1070,7 @@ def main():
     migrator = SimpleMilvusToEndeeMigrator(
         milvus_url=args.source_url,
         milvus_token=args.source_api_key,
+        milvus_db=args.source_db,
         milvus_collection=args.source_collection,
         milvus_port=args.source_port,
         endee_url=args.target_url,

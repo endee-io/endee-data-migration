@@ -14,6 +14,8 @@ import os
 import dotenv
 import asyncio
 from constants import *
+from qdrant_client.http.models import Distance
+
 
 dotenv.load_dotenv()
 
@@ -41,6 +43,11 @@ PRECISION_NAMES = {
     Precision.INT8:     "int8",
     Precision.INT16:    "int16",
     Precision.FLOAT32:  "float32",
+}
+QDRANT_TO_ENDEE_SPACE = {
+    Distance.COSINE: "cosine",
+    Distance.EUCLID: "l2",
+    Distance.DOT:    "ip",
 }
 
 
@@ -402,6 +409,15 @@ class SimpleQdrantToEndeeMigrator:
         collection_info = self.qdrant_client.get_collection(self.qdrant_collection)
         
         vectors = collection_info.config.params.vectors
+
+        # ── GUARD: reject hybrid collections in the dense-only script ──────────
+        sparse_vectors = collection_info.config.params.sparse_vectors
+        if sparse_vectors and isinstance(sparse_vectors, dict) and len(sparse_vectors) > 0:
+            raise ValueError(
+                f"Collection '{self.qdrant_collection}' is a HYBRID collection "
+                f"(sparse fields detected: {list(sparse_vectors.keys())}).\n"
+                f"Use qdrant_to_endee_hybrid_migration.py instead."
+            )
         
         if isinstance(vectors, dict):
             vectors_map = vectors
@@ -412,14 +428,13 @@ class SimpleQdrantToEndeeMigrator:
         
         vectors_dimension = collection_info.config.params.vectors.size
         qdrant_space_type = collection_info.config.params.vectors.distance
-        if qdrant_space_type == "Cosine":
+        endee_space_type = QDRANT_TO_ENDEE_SPACE.get(qdrant_space_type)
+        if endee_space_type is None:
+            logger.warning(
+                f"Unknown space type '{qdrant_space_type}', defaulting to cosine"
+            )
             endee_space_type = "cosine"
-        elif qdrant_space_type == "Euclid":
-            endee_space_type = "l2"
-        elif qdrant_space_type == "Dot":
-            endee_space_type = "ip"
-        else:
-            raise ValueError(f"Invalid space type: {qdrant_space_type}")
+
         
         for _, config in vectors_map.items():
             vectors_dimension = config.size
