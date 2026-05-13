@@ -590,18 +590,37 @@ class QdrantHybridToEndeeMigrator:
             logger.info(f"✓ Created hybrid index: {self.endee_index_name}")
     
     async def async_fetch_batch(self, offset: Optional[Any]) -> tuple:
-        """Fetch a single batch from Qdrant"""
+        """Fetch a single batch from Qdrant with retry logic"""
         loop = asyncio.get_running_loop()
-        logger.info(f"FETCH: submitting scroll to executor, offset={offset}")  # add this
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: self._scroll_with_logging(offset)  # wrap with logging
-            ),
-            timeout=30,
-        )
-        points_batch, next_offset = result
-        return points_batch, next_offset
+        max_retries = 5
+
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"FETCH: submitting scroll to executor, offset={offset} (attempt {attempt + 1}/{max_retries})")
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None,
+                        lambda: self._scroll_with_logging(offset)
+                    ),
+                    timeout=60,
+                )
+                points_batch, next_offset = result
+                return points_batch, next_offset
+
+            except Exception as e:
+                wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Fetch failed at offset {offset} "
+                        f"(attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"Fetch at offset {offset} failed after {max_retries} attempts: {e}"
+                    )
+                    raise
 
     def _scroll_with_logging(self, offset):
         logger.info(f"SCROLL: thread started, offset={offset}")   # runs in executor thread
