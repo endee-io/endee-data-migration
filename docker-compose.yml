@@ -8,6 +8,9 @@ services:
       - ./data:/app/data
     networks:
       - vector-net
+    build:
+      context: .
+      network: host
 
 networks:
   vector-net:
