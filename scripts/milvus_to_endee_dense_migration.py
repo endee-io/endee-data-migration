@@ -569,7 +569,7 @@ class SimpleMilvusToEndeeMigrator:
             raise ValueError("No primary key field found in collection")
         if not self.vector_field_name:
             raise ValueError("No vector field found in collection")
-        validate_hnsw_params(self.M, self.ef_construct)
+        # validate_hnsw_params(self.M, self.ef_construct)
         return self.vector_field_info
     
     def get_or_create_endee_index(self):
@@ -1121,9 +1121,9 @@ def main():
     # Resume arguments
     parser.add_argument("--checkpoint_file", default=CHECKPOINT_FILE,
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
-    parser.add_argument("--clear_checkpoint", action="store_true", 
-                       default=os.getenv("CLEAR_CHECKPOINT","false").lower() == "true",
-                       help="Clear existing checkpoint and start fresh")
+    parser.add_argument("--resume", action="store_true",
+                   default=os.getenv("RESUME", "true").lower() == "false",
+                   help="Resume from last checkpoint. Set RESUME=false to start fresh.")
     
     # Debug
     parser.add_argument("--debug", action="store_true", 
@@ -1178,7 +1178,7 @@ def main():
     )
     
     # Clear checkpoint if requested
-    if args.clear_checkpoint:
+    if args.resume:
         logger.info("Clearing checkpoint for fresh start...")
         migrator.checkpoint.clear()
     

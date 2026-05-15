@@ -50,6 +50,27 @@ QDRANT_TO_ENDEE_SPACE = {
     Distance.DOT:    "ip",
 }
 
+def validate_hnsw_params(M: int, ef_construct: int) -> None:
+    errors = []
+    if M is None:
+        errors.append("  M is not set — provide via --M / M env var, or ensure source collection has an HNSW index.")
+    elif M <= 0:
+        errors.append(f"  M must be a positive integer, got: {M}")
+
+    if ef_construct is None:
+        errors.append("  ef_construct is not set — provide via --ef_construct / EF_CONSTRUCT env var, or ensure source collection has an HNSW index.")
+    elif ef_construct <= 0:
+        errors.append(f"  ef_construct must be a positive integer, got: {ef_construct}")
+
+    if errors:
+        logger.error("=" * 80)
+        logger.error("INVALID HNSW PARAMETERS — migration cannot start:")
+        for e in errors:
+            logger.error(e)
+        logger.error("=" * 80)
+        sys.exit(1)
+
+    logger.info(f"HNSW params validated: M={M}, ef_construct={ef_construct}")
 
 def validate_precision_downgrade(user_precision: Any, source_precision: Any) -> None:
     if user_precision not in set(PRECISION_STR_TO_ENDEE.values()):
@@ -83,7 +104,7 @@ def validate_precision_downgrade(user_precision: Any, source_precision: Any) -> 
 
     logger.info(
         f"Precision check passed: "
-        f"{PRECISION_NAMES[source_precision]} (source) → {PRECISION_NAMES[user_precision]} (target)"
+        f"{PRECISION_NAMES[source_precision]} (source)  {PRECISION_NAMES[user_precision]} (target)"
     )
 
 class MigrationCheckpoint:
@@ -180,7 +201,9 @@ class SimpleQdrantToEndeeMigrator:
         checkpoint_file: str = CHECKPOINT_FILE,
         use_https: bool = False,
         filter_fields: str = "",
-        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE
+        max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
+        M: int = None,
+        ef_construct: int = None,
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
@@ -203,6 +226,8 @@ class SimpleQdrantToEndeeMigrator:
         self.endee_client = None
         self.endee_index = None
         self._stop_event = None
+        self.M = M
+        self.ef_construct = ef_construct
 
         # Statistics
         self.stats = {
@@ -440,8 +465,22 @@ class SimpleQdrantToEndeeMigrator:
             vectors_dimension = config.size
             break
         
-        M = collection_info.config.hnsw_config.m
-        ef_construct = collection_info.config.hnsw_config.ef_construct
+        source_M = collection_info.config.hnsw_config.m
+        source_ef = collection_info.config.hnsw_config.ef_construct
+
+        if self.M is None:
+            M = source_M
+            logger.info(f"  M: from source collection  {M}")
+        else:
+            M = self.M
+            logger.info(f"  M: user-specified  {M}")
+
+        if self.ef_construct is None:
+            ef_construct = source_ef
+            logger.info(f"  ef_construct: from source collection  {ef_construct}")
+        else:
+            ef_construct = self.ef_construct
+            logger.info(f"  ef_construct: user-specified  {ef_construct}")
 
         if collection_info.config.quantization_config:
             quantization_config = dict(collection_info.config.quantization_config)
@@ -486,6 +525,8 @@ class SimpleQdrantToEndeeMigrator:
         
         logger.info(f"✓ Collection config: dim={config[DIMENSION_KEY]}, "
                    f"space={config[SPACE_TYPE_KEY]}, M={config[M_KEY]}, ef={config[EF_CONSTRUCT_KEY]}, precision={endee_precision}")
+        # validate_hnsw_params(M, ef_construct)
+
         return config
     
     def get_or_create_endee_index(self, config: Dict[str, Any]):
@@ -752,10 +793,15 @@ def main():
     # Resume arguments
     parser.add_argument("--checkpoint_file", default=CHECKPOINT_FILE, 
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
-    parser.add_argument("--clear_checkpoint", action="store_true", 
-                       default=os.getenv("CLEAR_CHECKPOINT","false").lower() == "true",
-                       help="Clear existing checkpoint and start fresh")
-    
+    parser.add_argument("--resume", action="store_true",
+                   default=os.getenv("RESUME", "true").lower() == "false",
+                   help="Resume from last checkpoint. Set RESUME=false to start fresh.")
+    parser.add_argument("--M", type=int,
+                    default=int(os.getenv("M")) if os.getenv("M") else None,
+                    help="HNSW M parameter. Falls back to source collection value if not set.")
+    parser.add_argument("--ef_construct", type=int,
+                        default=int(os.getenv("EF_CONSTRUCT")) if os.getenv("EF_CONSTRUCT") else None,
+                        help="HNSW ef_construct parameter. Falls back to source collection value if not set.")
     # Debug
     parser.add_argument("--debug", action="store_true", 
                        default=os.getenv("DEBUG",False),
@@ -808,11 +854,13 @@ def main():
         upsert_batch_size=args.upsert_size,
         checkpoint_file=args.checkpoint_file,
         use_https=args.use_https,
-        is_multivector=args.is_multivector
+        is_multivector=args.is_multivector,
+        M=args.M,
+        ef_construct=args.ef_construct,
     )
     
     # Clear checkpoint if requested
-    if args.clear_checkpoint:
+    if args.resume:
         logger.info("Clearing checkpoint for fresh start...")
         migrator.checkpoint.clear()
     
