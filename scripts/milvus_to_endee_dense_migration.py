@@ -370,6 +370,7 @@ class SimpleMilvusToEndeeMigrator:
             logger.info("Connected to Milvus")
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
+            sys.exit(1)
     
     def connect_endee(self):
         """Connect to Endee"""
