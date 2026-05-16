@@ -49,6 +49,81 @@ PRECISION_STR_TO_ENDEE = {
     "binary":  Precision.BINARY2,
 }
 
+PRECISION_RANK = {
+    Precision.BINARY2:  0,
+    Precision.INT8:     1,
+    Precision.INT16:    2,
+    Precision.FLOAT16:  3,
+    Precision.FLOAT32:  4,
+}
+
+PRECISION_NAMES = {
+    Precision.BINARY2:  "binary",
+    Precision.INT8:     "int8",
+    Precision.INT16:    "int16",
+    Precision.FLOAT16:  "float16",
+    Precision.FLOAT32:  "float32",
+}
+
+def validate_hnsw_params(M: int, ef_construct: int) -> None:
+    errors = []
+    if M is None:
+        errors.append("  M is not set — provide via --M / M env var, or ensure source collection has an HNSW index.")
+    elif M <= 0:
+        errors.append(f"  M must be a positive integer, got: {M}")
+
+    if ef_construct is None:
+        errors.append("  ef_construct is not set — provide via --ef_construct / EF_CONSTRUCT env var, or ensure source collection has an HNSW index.")
+    elif ef_construct <= 0:
+        errors.append(f"  ef_construct must be a positive integer, got: {ef_construct}")
+
+    if errors:
+        logger.error("=" * 80)
+        logger.error("INVALID HNSW PARAMETERS — migration cannot start:")
+        for e in errors:
+            logger.error(e)
+        logger.error("=" * 80)
+        sys.exit(1)
+
+    logger.info(f"HNSW params validated: M={M}, ef_construct={ef_construct}")
+
+def validate_precision_downgrade(user_precision: Any, source_precision: Any) -> None:
+    if user_precision not in set(PRECISION_STR_TO_ENDEE.values()):
+        logger.error("=" * 80)
+        logger.error(f"INVALID PRECISION — '{user_precision}' is not supported by Endee.")
+        logger.error(f"  Supported values: {list(PRECISION_STR_TO_ENDEE.keys())}")
+        logger.error("=" * 80)
+        sys.exit(1)
+
+    source_rank = PRECISION_RANK.get(source_precision)
+    if source_rank is None:
+        logger.warning(
+            f"Source precision could not be detected (got '{source_precision}').\n"
+            f"Skipping downgrade check. Proceeding with '{PRECISION_NAMES.get(user_precision)}'.\n"
+            "If incompatible, Endee will reject the upsert and migration will exit with an error."
+        )
+        return
+
+    user_rank = PRECISION_RANK[user_precision]
+    if user_rank > source_rank:
+        valid_choices = ", ".join(
+            PRECISION_NAMES[p]
+            for p in PRECISION_RANK
+            if PRECISION_RANK[p] <= source_rank and p in set(PRECISION_STR_TO_ENDEE.values())
+        )
+        logger.error("=" * 80)
+        logger.error("PRECISION UPGRADE NOT ALLOWED — migration cannot start:")
+        logger.error(f"  Source precision : {PRECISION_NAMES[source_precision]}")
+        logger.error(f"  Requested        : {PRECISION_NAMES[user_precision]}")
+        logger.error(f"  Valid choices    : {valid_choices}")
+        logger.error("=" * 80)
+        sys.exit(1)
+
+    logger.info(
+        f"Precision check passed: "
+        f"{PRECISION_NAMES[source_precision]} (source) → {PRECISION_NAMES[user_precision]} (target)"
+    )
+
 class MigrationCheckpoint:
     """Simple checkpoint for resume capability"""
     
@@ -156,8 +231,8 @@ class SimpleMilvusToEndeeMigrator:
         fetch_batch_size: int = DEFAULT_FETCH_BATCH_SIZE,
         upsert_batch_size: int = DEFAULT_UPSERT_BATCH_SIZE,
         space_type: str = DEFAULT_SPACE_TYPE,
-        M: int = DEFAULT_M,
-        ef_construct: int = DEFAULT_EF_CONSTRUCT,
+        M: int = None,
+        ef_construct: int = None,
         checkpoint_file: str = CHECKPOINT_FILE,
         filter_fields: str = "",
         is_multivector: bool = False,
@@ -295,6 +370,7 @@ class SimpleMilvusToEndeeMigrator:
             logger.info("Connected to Milvus")
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
+            sys.exit(1)
     
     def connect_endee(self):
         """Connect to Endee"""
@@ -407,8 +483,20 @@ class SimpleMilvusToEndeeMigrator:
                      DataType.BINARY_VECTOR]:
                 index_info = self.milvus_client.describe_index(self.milvus_collection, field_name) or {}
                 print(index_info)
-                self.ef_construct = index_info.get('params', {}).get('efConstruction', self.ef_construct)
-                self.M = index_info.get('params', {}).get('M', self.M)
+                source_M = index_info.get('params', {}).get('M')
+                source_ef = index_info.get('params', {}).get('efConstruction')
+
+                if self.M is None:
+                    self.M = source_M
+                    logger.info(f"  M: from source collection → {self.M}")
+                else:
+                    logger.info(f"  M: user-specified → {self.M}")
+
+                if self.ef_construct is None:
+                    self.ef_construct = source_ef
+                    logger.info(f"  ef_construct: from source collection → {self.ef_construct}")
+                else:
+                    logger.info(f"  ef_construct: user-specified → {self.ef_construct}")
                 params = field.get('params', {})
                 dim = params.get('dim') or field.get('dim')
                 
@@ -429,13 +517,14 @@ class SimpleMilvusToEndeeMigrator:
                 # Use the first vector field found
                 if self.vector_field_name is None:
                     self.vector_field_name = field_name
+                    self.vector_field_type = field_type          # ← also set this here (was missing!)
                     self.vectors_dimension = dim
-                    # Priority: user-provided > metadata > INT16 default
                     if self.precision is None:
                         self.precision = detected_precision
-                        logger.info(f"  Precision: auto-detected from metadata → {self.precision}")
+                        logger.info(f"  Precision: auto-detected → {PRECISION_NAMES.get(self.precision)}")
                     else:
-                        logger.info(f"  Precision: user-specified → {self.precision}")
+                        validate_precision_downgrade(self.precision, detected_precision)
+                        logger.info(f"  Precision: user-specified → {PRECISION_NAMES.get(self.precision)}")
                 
                 logger.info(f"✓ Vector Field: '{field_name}' [{field_type}, dim={dim}, precision={self.precision}]")
             
@@ -481,7 +570,7 @@ class SimpleMilvusToEndeeMigrator:
             raise ValueError("No primary key field found in collection")
         if not self.vector_field_name:
             raise ValueError("No vector field found in collection")
-        
+        # validate_hnsw_params(self.M, self.ef_construct)
         return self.vector_field_info
     
     def get_or_create_endee_index(self):
@@ -1023,17 +1112,19 @@ def main():
     # Collection configuration
     parser.add_argument("--space_type", default=DEFAULT_SPACE_TYPE,
                        help="Distance metric (default: cosine)")
-    parser.add_argument("--M", type=int, default=DEFAULT_M,
-                       help="HNSW M parameter (default: 16)")
-    parser.add_argument("--ef_construct", type=int, default=DEFAULT_EF_CONSTRUCT,
-                       help="HNSW ef_construct parameter (default: 128)")
+    parser.add_argument("--M", type=int,
+                    default=int(os.getenv("M")) if os.getenv("M") else None,
+                    help="HNSW M parameter. Falls back to source collection value if not set.")
+    parser.add_argument("--ef_construct", type=int,
+                        default=int(os.getenv("EF_CONSTRUCT")) if os.getenv("EF_CONSTRUCT") else None,
+                        help="HNSW ef_construct parameter. Falls back to source collection value if not set.")
 
     # Resume arguments
     parser.add_argument("--checkpoint_file", default=CHECKPOINT_FILE,
                        help="Checkpoint file path (default: ./migration_checkpoint.json)")
-    parser.add_argument("--clear_checkpoint", action="store_true", 
-                       default=os.getenv("CLEAR_CHECKPOINT","false").lower() == "true",
-                       help="Clear existing checkpoint and start fresh")
+    parser.add_argument("--resume", action="store_true",
+                   default=os.getenv("RESUME", "true").lower() == "false",
+                   help="Resume from last checkpoint. Set RESUME=false to start fresh.")
     
     # Debug
     parser.add_argument("--debug", action="store_true", 
@@ -1088,7 +1179,7 @@ def main():
     )
     
     # Clear checkpoint if requested
-    if args.clear_checkpoint:
+    if args.resume:
         logger.info("Clearing checkpoint for fresh start...")
         migrator.checkpoint.clear()
     

@@ -6,8 +6,7 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-    networks:
-      - vector-net
+    network_mode: host
 
 networks:
   vector-net:

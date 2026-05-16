@@ -66,6 +66,39 @@ Make sure:
 
 ---
 
+## Environment Variables Reference
+
+| Variable | Should You Change? | Description | Example Value |
+|---|---|---|---|
+| `MIGRATION_TYPE` | Required | Selects which migration script to run. Must match your source DB and collection type. See available values below. | `milvus-to-endee-dense` |
+| `SOURCE_URL` | Required | Full URL of your source Qdrant or Milvus server | `http://192.168.1.10` |
+| `SOURCE_PORT` | Required | Port your source DB listens on | `6333` (Qdrant), `19530` (Milvus) |
+| `SOURCE_API_KEY` | If auth enabled | API key or token for your source DB. Leave blank if auth is disabled. | `your-qdrant-api-key` |
+| `SOURCE_COLLECTION` | Required | Name of the collection in the source DB to migrate from | `my_collection` |
+| `TARGET_URL` | Required | URL of your Endee server | `http://192.168.1.20:8080` |
+| `TARGET_API_KEY` | Required | Endee API key with write access | `your-endee-api-key` |
+| `TARGET_COLLECTION` | Required | Name of the Endee index to create or write into. Created automatically if it does not exist. | `my_index` |
+| `FILTER_FIELDS` | Optional | Comma-separated fields to store in Endee's `filter` slot for fast filtering. All other fields go to `meta`. Leave blank to put everything in `meta`. | `category,status,year` |
+| `PRECISION` | Required | Vector storage precision in Endee. Explicitly setting it is recommended. See precision table below. | `INT16` |
+| `IS_MULTIVECTOR` | Do not change | Reserved for future use. Multivector mode is not currently supported. Always leave as `false`. | `false` |
+| `M` | Required | Number of bidirectional links per node in the HNSW graph. Higher = better recall but slower inserts and more memory. Auto-read from source collection if not set. Cannot be zero or negative. | `16` |
+| `EF_CONSTRUCT` | Required | Search beam width during index construction. Higher = better graph quality but slower inserts. Auto-read from source collection if not set. Cannot be zero or negative. | `128` |
+| `BATCH_SIZE` | Required | Number of records fetched from the source DB per batch. Lower this if you hit memory limits. | `1000` |
+| `UPSERT_SIZE` | Required | Number of records sent to Endee per upsert call. Lower this if upserts time out. | `1000` |
+| `MAX_QUEUE_SIZE` | Required | Max number of fetched batches held in memory waiting to be upserted. Controls memory pressure between producer and consumer. | `5` |
+| `RESUME` | Required | Set `true` to continue from the last saved checkpoint. Set `false` to start completely fresh (clears the checkpoint). | `true` |
+| `CHECKPOINT_FILE` | Do not change | Path inside the container where progress is saved after every successful batch. Changing this breaks the resume feature. | `/app/data/checkpoints/migration.json` |
+| `DEBUG` | Do Not Change | `true` to enable verbose debug logging. Leave `false` in normal operation. | `false` |
+
+**Available `MIGRATION_TYPE` values:**
+
+| Value | Source | Vector Mode |
+|---|---|---|
+| `milvus-to-endee-dense` | Milvus | Dense vectors only |
+| `milvus-to-endee-hybrid` | Milvus | Dense + sparse vectors |
+| `qdrant-to-endee-dense` | Qdrant | Dense vectors only |
+| `qdrant-to-endee-hybrid` | Qdrant | Named dense (`dense`) + sparse (`sparse_keywords`) vectors |
+
 
 ## Running the Migration
 
