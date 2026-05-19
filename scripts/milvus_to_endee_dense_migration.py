@@ -1110,7 +1110,7 @@ def main():
                        help="Upsert batch size (default: 1000)")
 
     # Collection configuration
-    parser.add_argument("--space_type", default=DEFAULT_SPACE_TYPE,
+    parser.add_argument("--space_type", default=os.getenv("SPACE_TYPE"),
                        help="Distance metric (default: cosine)")
     parser.add_argument("--M", type=int,
                     default=int(os.getenv("M")) if os.getenv("M") else None,
