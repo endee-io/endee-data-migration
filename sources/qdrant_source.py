@@ -1,6 +1,6 @@
 """
 sources/qdrant_source.py
-──────────────────────────────────────────────────────────────────────────────
+--------------------------------------------------------------------------------------
 Qdrant source connectors (dense-only and hybrid).
 
 QdrantDenseSource  — validates dense-only collections, rejects hybrid ones.
@@ -14,7 +14,7 @@ Both share a common QdrantBaseSource that handles:
   - Scroll-based async batch iteration with retry
 
 Cursor format
-─────────────
+-------------------
 Qdrant uses the scroll API's offset cursor (a UUID or None).
 Cursor = None means "start from the beginning" (or "end of collection").
 """
@@ -24,13 +24,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, AsyncGenerator, Dict, List,  Optional, Tuple
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance
 
 from core.base_source import BaseSource
-from core.record      import IndexConfig, MigrationRecord
+from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ QDRANT_TO_ENDEE_SPACE = {
     Distance.DOT:    "ip",
 }
 
-# ── Precision helpers ─────────────────────────────────────────────────────────
+# # ── Precision helpers ─────────────────────────────────────────────────────────
 PRECISION_STR_TO_ENDEE: Dict[str, Any] = {}
 PRECISION_RANK:         Dict[Any, int]  = {}
 PRECISION_NAMES:        Dict[Any, str]  = {}
@@ -261,6 +262,7 @@ class QdrantBaseSource(BaseSource):
     # ── Record conversion ─────────────────────────────────────────────────────
 
     def _convert_records(self, points) -> List[MigrationRecord]:
+        t0 = time.time()
         records = []
         for pt in points:
             try:
@@ -296,6 +298,11 @@ class QdrantBaseSource(BaseSource):
                 logger.error(f"Error converting point {pt.id}: {e}")
                 logger.error(traceback.format_exc())
                 continue
+        transform_time = time.time() - t0
+        logger.info(
+            f"  [SOURCE→COMMON] {len(records)}/{len(points)} records converted "
+            f"in {transform_time:.3f}s"
+        )
         return records
 
     # ── Scroll with retry ─────────────────────────────────────────────────────
@@ -380,7 +387,21 @@ class QdrantDenseSource(QdrantBaseSource):
                 f"(sparse fields: {list(sparse_vectors.keys())}).\n"
                 f"Use QdrantHybridSource instead."
             )
-        logger.info("Schema validated: dense-only collection")
+        logger.info("✓ Schema validated: dense-only collection")
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            url           = args.source_url,
+            collection    = args.source_collection,
+            api_key       = args.source_api_key,
+            port          = args.source_port,
+            use_https     = args.use_https,
+            space_type    = args.space_type if args.space_type != "cosine" else None,
+            M             = args.M,
+            ef_construct  = args.ef_construct,
+            precision     = args.precision,
+            filter_fields = args.filter_fields,
+        )
 
 
 class QdrantHybridSource(QdrantBaseSource):
@@ -404,6 +425,21 @@ class QdrantHybridSource(QdrantBaseSource):
                 f"Use QdrantDenseSource instead."
             )
         logger.info(
-            f"Schema validated: hybrid collection "
+            f"✓ Schema validated: hybrid collection "
             f"(dense={self.dense_field_name}, sparse={self.sparse_field_name})"
+        )
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            url           = args.source_url,
+            collection    = args.source_collection,
+            api_key       = args.source_api_key,
+            port          = args.source_port,
+            use_https     = args.use_https,
+            space_type    = args.space_type if args.space_type != "cosine" else None,
+            M             = args.M,
+            ef_construct  = args.ef_construct,
+            precision     = args.precision,
+            filter_fields = args.filter_fields,
         )

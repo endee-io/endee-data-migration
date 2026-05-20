@@ -32,6 +32,7 @@ from endee.exceptions import NotFoundException
 
 from core.base_sink import BaseSink
 from core.record    import IndexConfig, MigrationRecord
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,13 @@ class EndeeSink(BaseSink):
         Returns True on full success, False if any chunk exhausts retries.
         Never raises — errors are logged and False is returned.
         """
+        t0 = time.time()
         endee_records = [self._to_endee(r) for r in records]
+        transform_time = time.time() - t0
+        logger.info(
+            f"  [COMMON→ENDEE] {len(endee_records)} records converted "
+            f"in {transform_time:.3f}s"
+        )
         chunks = [
             endee_records[i: i + self.upsert_chunk_size]
             for i in range(0, len(endee_records), self.upsert_chunk_size)
@@ -198,6 +205,16 @@ class EndeeSink(BaseSink):
                 return False
 
         return True
+
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            endee_url         = args.target_url,
+            endee_api_key     = args.target_api_key,
+            index_name        = args.target_collection,
+            upsert_chunk_size = args.upsert_size,
+        )
 
     def close(self):
         pass

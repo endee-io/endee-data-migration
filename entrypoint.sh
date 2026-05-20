@@ -15,90 +15,79 @@ ${CYAN}╔═══════════════════════�
 ╚══════════════════════════════════════════════════════╝${NC}
 
 ${GREEN}Usage:${NC}
-  docker run [docker-options] vector-migration ${YELLOW}<MIGRATION_TYPE>${NC} [OPTIONS]
-
-${GREEN}Migration types:${NC}
-  ${YELLOW}milvus-to-endee-dense${NC}    Dense Milvus collection → Endee
-  ${YELLOW}milvus-to-endee-hybrid${NC}   Hybrid Milvus collection (dense+sparse) → Endee
-  ${YELLOW}qdrant-to-endee-dense${NC}    Dense Qdrant collection → Endee
-  ${YELLOW}qdrant-to-endee-hybrid${NC}   Hybrid Qdrant collection (dense+sparse) → Endee
+  docker run vector-migration --from DB --to DB --type TYPE [OPTIONS]
 
 ${GREEN}Required:${NC}
-  --source_url URL              Source database URL
-  --source_collection NAME      Source collection name
-  --target_api_key KEY          Endee API key
-  --target_collection NAME      Endee index name
-  --ef_construct N              HNSW ef_construct (auto-detected if omitted)
-  --resume                      Clear checkpoint and start fresh (RESUME=false)
-  --precision PREC              float32 | float16 | int8 | int16 | binary
-  --M N                         HNSW M (auto-detected from source if omitted)
-  --space_type TYPE             cosine | l2 | ip (default: cosine)
+  --from DB             Source database:  milvus | qdrant
+  --to   DB             Target database:  endee
+  --type TYPE           Vector type:      dense | hybrid
 
-${GREEN}Optional:${NC}
-  --source_api_key KEY          Source DB API key (default: "")
-  --source_db NAME              Milvus DB name (default: "default")
-  --batch_size N                Fetch batch size (default: 1000)
-  --upsert_size N               Endee upsert chunk size (default: 1000)
-  --max_queue_size N            Queue depth for backpressure (default: 5)
-  --checkpoint_file PATH        Checkpoint file (default: ./migration_checkpoint.json)
-  --debug                       Verbose logging
+${GREEN}Source options:${NC}
+  --source_url URL
+  --source_api_key KEY
+  --source_collection NAME
+  --source_port PORT
+  --source_db NAME          Milvus database name (default: default)
+  --filter_fields F1,F2     Payload fields to expose as filter attributes
+  --use_https               Use HTTPS for Qdrant
 
-${GREEN}Environment variables:${NC}
-  All --flags above map 1-to-1 with env vars (upper-cased, e.g. SOURCE_URL).
-  MIGRATION_TYPE can replace the positional arg.
+${GREEN}Target options:${NC}
+  --target_url URL
+  --target_api_key KEY
+  --target_collection NAME
+
+${GREEN}Index options:${NC}
+  --space_type cosine|l2|ip   (default: cosine)
+  --M N                       HNSW M (auto-detected if omitted)
+  --ef_construct N            HNSW ef_construct (auto-detected if omitted)
+  --precision float32|float16|int8|int16|binary
+
+${GREEN}Performance:${NC}
+  --batch_size N          Fetch batch size (default: 1000)
+  --upsert_size N         Endee chunk size (default: 100)
+  --max_queue_size N      Queue depth (default: 5)
+
+${GREEN}Checkpoint:${NC}
+  --checkpoint_file PATH  (default: ./migration_checkpoint.json)
+  --resume                Clear checkpoint, start fresh (RESUME=false)
+
+${GREEN}Env var equivalents:${NC}
+  FROM_DB, TO_DB, VECTOR_TYPE, SOURCE_URL, SOURCE_API_KEY,
+  SOURCE_COLLECTION, TARGET_URL, TARGET_API_KEY, TARGET_COLLECTION,
+  PRECISION, BATCH_SIZE, UPSERT_SIZE, RESUME, DEBUG
 
 ${GREEN}Examples:${NC}
   ${CYAN}# Milvus dense → Endee${NC}
-  docker run vector-migration ${YELLOW}milvus-to-endee-dense${NC} \\
+  docker run vector-migration \\
+    --from milvus --to endee --type dense \\
     --source_url http://localhost:19530 \\
-    --source_collection my_collection \\
+    --source_collection my_col \\
     --target_api_key "ek-..." \\
     --target_collection my_index \\
     --precision int16
 
-  ${CYAN}# Qdrant hybrid → Endee, resume from checkpoint${NC}
-  docker run -v \$(pwd)/data:/app/data vector-migration \\
-    ${YELLOW}qdrant-to-endee-hybrid${NC} \\
-    --source_url http://localhost:6333 \\
-    --source_collection hybrid_col \\
-    --target_api_key "ek-..." \\
-    --target_collection hybrid_index \\
-    --precision int16
+  ${CYAN}# Qdrant hybrid → Endee, via env vars${NC}
+  docker run --env-file .env vector-migration \\
+    --from qdrant --to endee --type hybrid
 
   ${CYAN}# Fresh start (clear checkpoint)${NC}
-  docker run vector-migration ${YELLOW}milvus-to-endee-dense${NC} --resume ...
-
+  docker run vector-migration --from milvus --to endee --type dense --resume ...
 EOF
 }
 
-# Positional migration type (CLI beats env var)
-if [ -n "$1" ] && [[ "$1" != --* ]]; then
-    MIGRATION_TYPE="$1"; shift
-fi
-
 if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     show_help; exit 0
-fi
-
-if [ -z "$MIGRATION_TYPE" ]; then
-    print_error "No migration type specified."
-    echo "Pass it as the first argument or set MIGRATION_TYPE in your env."
-    show_help; exit 1
 fi
 
 echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║         Endee Migration Tool v2.0                    ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-print_info "Migration Type: ${YELLOW}${MIGRATION_TYPE}${NC}"
-echo ""
 
-# Show env-based config summary
 [ -n "$SOURCE_URL" ]        && echo "  Source URL        : $SOURCE_URL"
 [ -n "$SOURCE_COLLECTION" ] && echo "  Source Collection : $SOURCE_COLLECTION"
 [ -n "$TARGET_COLLECTION" ] && echo "  Target Collection : $TARGET_COLLECTION"
-[ -n "$BATCH_SIZE" ]        && echo "  Batch Size        : $BATCH_SIZE"
 [ -n "$PRECISION" ]         && echo "  Precision         : $PRECISION"
 echo ""
 
-exec python /app/migrate.py "$MIGRATION_TYPE" "$@"
+exec python /app/migrate.py "$@"

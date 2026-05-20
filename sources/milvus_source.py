@@ -7,13 +7,13 @@ MilvusDenseSource  — validates dense-only collections, rejects hybrid ones.
 MilvusHybridSource — validates hybrid collections (dense+sparse), rejects dense-only.
 
 Both share a common MilvusBaseSource that handles:
-  - Connection (with protocol auto-fix)
-  - Collection loading (with timeout)
-  - Field schema detection
-  - HNSW parameter detection
-  - Vector byte decoding (FLOAT16, FLOAT32, BINARY)
-  - QueryIterator-based async batch iteration (no 16384 offset cap)
-  - Checkpoint-skip on resume (count-based)
+  • Connection (with protocol auto-fix)
+  • Collection loading (with timeout)
+  • Field schema detection
+  • HNSW parameter detection
+  • Vector byte decoding (FLOAT16, FLOAT32, BINARY)
+  • QueryIterator-based async batch iteration (no 16384 offset cap)
+  • Checkpoint-skip on resume (count-based)
 
 Cursor format
 ─────────────
@@ -130,7 +130,7 @@ def _validate_precision_downgrade(user_precision, source_precision):
         )
     logger.info(
         f"Precision check passed: "
-        f"{PRECISION_NAMES[source_precision]} (source) - {PRECISION_NAMES[user_precision]} (target)"
+        f"{PRECISION_NAMES[source_precision]} (source) → {PRECISION_NAMES[user_precision]} (target)"
     )
 
 
@@ -197,12 +197,12 @@ class MilvusBaseSource(BaseSource):
                 logger.info(f"Auto-added protocol: {uri}")
         try:
             self.milvus_client = MilvusClient(uri=uri, token=self.token, db_name=self.db)
-            logger.info("Connected to Milvus")
+            logger.info("✓ Connected to Milvus")
         except Exception as e:
             logger.error(f"Failed to connect to Milvus: {e}")
             sys.exit(1)
 
-    # -- COLLECTION LOADING ------------------------------------------------------
+    # ── Collection loading ────────────────────────────────────────────────────
 
     def _load_collection(self):
         logger.info(f"Loading collection '{self.collection}' into memory...")
@@ -222,7 +222,7 @@ class MilvusBaseSource(BaseSource):
                 ).get("state", ""))
                 logger.info(f"  Load state after {elapsed}s: {state}")
                 if state == "Loaded":
-                    logger.info("Collection loaded")
+                    logger.info("  ✓ Collection loaded")
                     return
             logger.error(f"Collection did not load within 300s. Last state: {state}")
             sys.exit(1)
@@ -487,7 +487,22 @@ class MilvusDenseSource(MilvusBaseSource):
                 f"(sparse fields: {[f['name'] for f in sparse_fields]}).\n"
                 f"Use MilvusHybridSource instead."
             )
-        logger.info("Schema validated: dense-only collection")
+        logger.info("✓ Schema validated: dense-only collection")
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            url           = args.source_url,
+            token         = args.source_api_key,
+            collection    = args.source_collection,
+            db            = args.source_db,
+            port          = args.source_port or 19530,
+            space_type    = args.space_type,
+            M             = args.M,
+            ef_construct  = args.ef_construct,
+            precision     = args.precision,
+            filter_fields = args.filter_fields,
+        )
 
 
 class MilvusHybridSource(MilvusBaseSource):
@@ -537,3 +552,18 @@ class MilvusHybridSource(MilvusBaseSource):
         config = super().get_index_config()
         config.sparse_dimension = self._detect_sparse_dimension()
         return config
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            url           = args.source_url,
+            token         = args.source_api_key,
+            collection    = args.source_collection,
+            db            = args.source_db,
+            port          = args.source_port or 19530,
+            space_type    = args.space_type,
+            M             = args.M,
+            ef_construct  = args.ef_construct,
+            precision     = args.precision,
+            filter_fields = args.filter_fields,
+        )
