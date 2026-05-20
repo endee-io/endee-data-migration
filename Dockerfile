@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy migration scripts and modules
 COPY sources/     /app/sources/
-COPY sinks/       /app/sinks/
+COPY targets/       /app/targets/
 COPY core/        /app/core/
 COPY migrate.py /app/migrate.py
 COPY entrypoint.sh /app/entrypoint.sh
