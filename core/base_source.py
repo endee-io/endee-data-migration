@@ -12,11 +12,12 @@ Nothing else in the codebase needs to change.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, List, Tuple, TYPE_CHECKING
+from typing import Any, List, Tuple, TYPE_CHECKING, AsyncGenerator
+from .schema import RowSchema, MigrationRow
 
-if TYPE_CHECKING:
-    from .record import MigrationRecord, IndexConfig
-    from .checkpoint import MigrationCheckpoint
+# if TYPE_CHECKING:
+#     from .record import MigrationRecord, IndexConfig
+#     from .checkpoint import MigrationCheckpoint
 
 
 class BaseSource(ABC):
@@ -24,15 +25,14 @@ class BaseSource(ABC):
     Abstract source connector.
 
     Lifecycle (called by MigrationPipeline in this order):
-        connect()         establish DB connection
-        detect_schema()   inspect collection schema, populate internal state
-        get_index_config()  return IndexConfig the sink will use
-        iterate_batches()   async-generator that yields migration batches
+        connect()        - establish DB connection
+        detect_schema()  - inspect collection schema, populate internal state
+        iterate_batches()  - async-generator that yields migration batches
 
     iterate_batches() contract
-    ──────────────────────────
+
     - Must be an async generator.
-    - Yields: (List[MigrationRecord], next_cursor)
+    - Yields: (List[MigrationRow], next_cursor)
         - next_cursor is an opaque value stored in the checkpoint; the pipeline
           passes it back as `initial_cursor` on resume.  Use `None` to signal
           "I am done; nothing more to resume from."
@@ -44,7 +44,6 @@ class BaseSource(ABC):
       the pipeline's `break` triggers proper teardown via async-generator aclose().
     """
 
-    # ── Abstract API ──────────────────────────────────────────────────────────
 
     @abstractmethod
     def connect(self) -> None:
@@ -60,40 +59,66 @@ class BaseSource(ABC):
         read HNSW index params.
         """
 
-    @abstractmethod
-    def get_index_config(self) -> "IndexConfig":
-        """
-        Return an IndexConfig describing the source collection.
-        Called *after* detect_schema(), so all schema info is available.
-        The pipeline passes this to the sink's setup_index().
-        """
+    # @abstractmethod
+    # def get_index_config(self) -> "IndexConfig":
+    #     """
+    #     Return an IndexConfig describing the source collection.
+    #     Called *after* detect_schema(), so all schema info is available.
+    #     The pipeline passes this to the sink's setup_index().
+
+    #     get_index_config() - return IndexConfig the sink will use
+    #     """
 
     @abstractmethod
     async def iterate_batches(
         self,
         batch_size: int,
         initial_cursor: Any,
-    ):
+        schema: RowSchema,
+    ) -> AsyncGenerator[Tuple[List[MigrationRow], Any], None]:
         """
         Async generator.
 
         Yields
         ------
-        Tuple[List[MigrationRecord], Any]
-            records     : batch of canonical records
-            next_cursor : checkpoint cursor to resume from next time
+        Async generator yielding (batch_of_rows, next_cursor).
+        Source fills MigrationRow slots using schema.index_of() or positionally.
 
         Parameters
         ----------
         batch_size     : how many records to fetch per iteration
         initial_cursor : value from checkpoint (None = fresh start)
+        schema         : schema of rows
         """
-        # Subclasses implement this as an async generator.
-        # The `yield` below is intentional — it turns this into an async
-        # generator stub so type checkers don't complain, but subclasses
-        # must override and actually yield data.
-        raise NotImplementedError
-        yield  # pragma: no cover
+        # # Subclasses implement this as an async generator.
+        # # The `yield` below is intentional — it turns this into an async
+        # # generator stub so type checkers don't complain, but subclasses
+        # # must override and actually yield data.
+        # raise NotImplementedError
+        # yield  # pragma: no cover
+
+    #  FACTORY CLASSMETHOD
+
+    @classmethod
+    @abstractmethod
+    def from_args(cls, args: Any) -> "BaseSource":
+        """
+        Construct an instance from the parsed CLI args namespace.
+
+        Each subclass implements this to pull only the args it needs,
+        keeping migrate.py free of any source-specific argument mapping.
+
+        Example
+        -------
+        @classmethod
+        def from_args(cls, args):
+            return cls(
+                url          = args.source_url,
+                token        = args.source_api_key,
+                collection   = args.source_collection,
+                ...
+            )
+        """
 
     # ── Optional hook ─────────────────────────────────────────────────────────
 
