@@ -29,7 +29,7 @@ class FieldType(Enum):
     INT           = auto()   # int
     FLOAT         = auto()   # float
     BOOL          = auto()   # bool
-    FLOAT_VECTOR  = auto()   # List[float] — fixed dimension dense vector
+    DENSE_VECTOR  = auto()   # List[float] — fixed dimension dense vector
     SPARSE_VECTOR = auto()   # Dict[int, float] — variable sparse vector
     JSON          = auto()   # dict — arbitrary nested payload
 
@@ -63,7 +63,7 @@ class FieldSchema:
     field_type: FieldType
     role:       FieldRole
     dimension:  Optional[int]  = None   # only for FLOAT_VECTOR
-    is_filterable: bool        = False  # hint: should this metadata go to filter? IT CAN BE REMOVED
+    # is_filterable: bool        = False  # hint: should this metadata go to filter? IT CAN BE REMOVED
 
 
 
@@ -84,12 +84,12 @@ class RowSchema:
     # STORE SCHEMA OF EACH COLUMN
     fields: List[FieldSchema]
 
-    # --- INDEX CREATION PARAMS ( FROM SOURCE, REPACES INDEXCONFIG ) ---
-    space_type:   str           = "cosine"
-    M:            int           = 16
-    ef_construct: int           = 128
-    precision:    Optional[Any] = 'int16'   # resolved by source (e.g. Precision.INT16)
-    sparse_model: Optional[str] = None  # e.g. "bm25" — for hybrid index creation
+    # # --- INDEX CREATION PARAMS ( FROM SOURCE, REPACES INDEXCONFIG ) ---
+    # space_type:   str
+    # M:            int
+    # ef_construct: int
+    # precision:    Optional[Any]
+    # sparse_model: Optional[str] = None  # e.g. "bm25" — for hybrid index creation
 
     #--- ROLE LOOKUPS ---------------------------------------------
 

@@ -6,8 +6,9 @@ import asyncio, logging, signal, time
 from typing import Optional
 from tqdm import tqdm
 from .base_source import BaseSource
-from .base_sink   import BaseSink
+from .base_target import BaseTarget
 from .checkpoint  import MigrationCheckpoint
+from .schema import RowSchema
 
 logger = logging.getLogger(__name__)
 
@@ -16,18 +17,19 @@ class MigrationPipeline:
     def __init__(
         self,
         source: BaseSource,
-        sink: BaseSink,
+        target: BaseTarget,
         checkpoint: MigrationCheckpoint,
         fetch_batch_size: int = 1000,
         max_queue_size: int = 5,
     ):
         self.source = source
-        self.sink = sink
+        self.target = target
         self.checkpoint = checkpoint
         self.fetch_batch_size = fetch_batch_size
         self.max_queue_size = max_queue_size
         self.interrupted = False
         self._stop_event: Optional[asyncio.Event] = None
+        self._schema: Optional[RowSchema] = None
         self.producer_failed = False
         self.stats = {"fetched": 0, "upserted": 0, "failed": 0, "batches_processed": 0, "start_time": None}
         signal.signal(signal.SIGINT,  self._signal_handler)
@@ -45,7 +47,7 @@ class MigrationPipeline:
         logger.info("PRODUCER: started")
         try:
             async for records, next_cursor in self.source.iterate_batches(
-                self.fetch_batch_size, initial_cursor
+                self.fetch_batch_size, initial_cursor, self._schema
             ):
                 if self.interrupted or self._stop_event.is_set():
                     logger.info("PRODUCER: stop requested — exiting loop")
@@ -85,7 +87,7 @@ class MigrationPipeline:
             queue_wait    = time.time() - batch["enqueue_time"]
             logger.info(f"CONSUMER: upserting batch {batch_number} ({len(records)} records, wait={queue_wait:.2f}s)")
             t0 = time.time()
-            success = await self.sink.upsert_batch(records)
+            success = await self.target.upsert_batch(records, self._schema)
             upsert_time = time.time() - t0
             if success:
                 self.checkpoint.update(batch_number, len(records), next_cursor)
@@ -118,28 +120,39 @@ class MigrationPipeline:
 
     def run(self):
         self.stats["start_time"] = time.time()
-        logger.info("=" * 80)
-        logger.info("MIGRATION PIPELINE — setting up source and sink")
-        logger.info("=" * 80)
+        logger.info("=" * 70)
+        logger.info("MIGRATION PIPELINE — setup")
+        logger.info("=" * 70)
+
+        # ── step 1: connect ───────────────────────────────────────────────────
         self.source.connect()
-        self.source.detect_schema()
-        config = self.source.get_index_config()
-        self.sink.connect()
-        self.sink.setup_index(config)
-        logger.info("=" * 80)
-        logger.info("MIGRATION PIPELINE — starting async producer-consumer")
+        self.target.connect()
+
+        # ── step 2: source builds schema (the contract for the whole pipeline) ─
+        self._schema = self.source.detect_schema()
+        logger.info(f"Schema built: {[f.name for f in self._schema.fields]}")
+        logger.info(f"  dimension={self._schema.dimension}, "
+                    f"space={self._schema.space_type}, "
+                    f"hybrid={self._schema.is_hybrid}")
+
+        # ── step 3: target uses schema to create index + resolve slots ──────────
+        self.target.setup_index(self._schema)
+
+        # ── step 4: data flows ─────────────────────────────────────────────────
+        logger.info("=" * 70)
+        logger.info("MIGRATION PIPELINE — data flow starting")
         logger.info(f"  Fetch batch size : {self.fetch_batch_size}")
         logger.info(f"  Queue size       : {self.max_queue_size}")
-        logger.info("=" * 80)
         if self.checkpoint.get_processed_count() > 0:
-            logger.info("RESUMING from checkpoint:")
-            logger.info(f"  Already processed : {self.checkpoint.get_processed_count()} records")
-            logger.info(f"  Last cursor       : {self.checkpoint.get_last_cursor()}")
+            logger.info(f"  Resuming from    : {self.checkpoint.get_processed_count()} records")
+        logger.info("=" * 70)
+
         try:
             asyncio.run(self._run_async())
         finally:
             self.source.close()
-            self.sink.close()
+            self.target.close()
+
         self._print_report()
 
     def _print_report(self):

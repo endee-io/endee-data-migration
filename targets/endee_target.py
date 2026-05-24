@@ -1,22 +1,22 @@
 """
-sinks/endee_sink.py
-──────────────────────────────────────────────────────────────────────────────
-Endee sink connector — handles both dense-only and hybrid indexes.
+    sinks/endee_sink.py
+    ============================
+    Endee sink connector — handles both dense-only and hybrid indexes.
 
-A single EndeeSink works for both:
-  • Dense  → IndexConfig.is_hybrid=False → creates a standard vector index
-  • Hybrid → IndexConfig.is_hybrid=True  → creates a hybrid (dense+sparse) index
+    A single EndeeSink works for both:
+    - Dense  -> IndexConfig.is_hybrid=False -> creates a standard vector index
+    - Hybrid -> IndexConfig.is_hybrid=True  -> creates a hybrid (dense+sparse) index
 
-MigrationRecord → Endee native format conversion:
-  Dense record:
-    {"id": str, "vector": [...], "filter": {...}, "meta": {...}}
-  Hybrid record:
-    {"id": str, "vector": [...], "sparse_indices": [...], "sparse_values": [...],
-     "filter": {...}, "meta": {...}}
+    MigrationRow -> Endee native format conversion:
+    Dense record:
+        {"id": str, "vector": [...], "filter": {...}, "meta": {...}}
+    Hybrid record:
+        {"id": str, "vector": [...], "sparse_indices": [...], "sparse_values": [...],
+        "filter": {...}, "meta": {...}}
 
-upsert_batch() splits the batch into upsert_chunk_size chunks, sends them
-all in parallel via asyncio.gather(), then retries any failures with
-exponential backoff (max 3 attempts).
+    upsert_batch() splits the batch into upsert_chunk_size chunks, sends them
+    all in parallel via asyncio.gather(), then retries any failures with
+    exponential backoff (max 3 attempts).
 """
 
 from __future__ import annotations
@@ -25,22 +25,21 @@ import asyncio
 import logging
 import sys
 import urllib.parse
-from typing import Any, List
+from typing import Any, List, Optional, Set
 
 from endee import Endee
 from endee.exceptions import NotFoundException
+from endee import Precision
 
-from core.base_sink import BaseSink
-from core.record    import IndexConfig, MigrationRecord
+from core.base_target import BaseTarget
+from core.schema import FieldRole, FieldType, MigrationRow, RowSchema
 import time
+from constants import DEFAULT_SPARSE_MODEL, ENDEE_V1_API
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SPARSE_MODEL = "bm25"
-ENDEE_V1_API         = "/api/v1/"
 
-
-class EndeeSink(BaseSink):
+class EndeeTarget(BaseTarget):
     """
     Endee sink connector.
 
@@ -55,20 +54,41 @@ class EndeeSink(BaseSink):
 
     def __init__(
         self,
-        endee_url: str,
-        endee_api_key: str,
-        index_name: str,
-        upsert_chunk_size: int = 100,
-        sparse_model: str = DEFAULT_SPARSE_MODEL,
+        endee_url:              str,
+        endee_api_key:          str,
+        index_name:             str,    
+        upsert_chunk_size:      int = 100,
+        sparse_model:           str = DEFAULT_SPARSE_MODEL,
+        filter_fields:          Optional[str] = "", # FROM USER
+        space_type:             str = "cosine",    
+        M:                      int = 16,          
+        ef_construct:           int = 128,         
+        precision:              Precision = Precision.INT16,   
+
     ):
         self.endee_url        = endee_url
         self.endee_api_key    = endee_api_key
         self.index_name       = index_name
         self.upsert_chunk_size = upsert_chunk_size
         self.sparse_model     = sparse_model
+        self.space_type        = space_type
+        self.M                 = M
+        self.ef_construct      = ef_construct
+        self.precision         = precision
 
         self._client: Any = None
         self._index:  Any = None
+
+        self.filter_fields: Set[str] = (
+            set(f.strip() for f in filter_fields.split(",") if f.strip())
+            if filter_fields else set()
+        )
+        self._pk_slot:     int = -1
+        self._dense_slot:  int = -1
+        self._sparse_slot: int = -1
+        self._payload_slots: List[int] = []
+        self._payload_types: List[FieldType] = []
+        self._payload_names: List[str] = []
 
     # ── connect ───────────────────────────────────────────────────────────────
 
@@ -84,56 +104,145 @@ class EndeeSink(BaseSink):
 
     # ── setup_index ───────────────────────────────────────────────────────────
 
-    def setup_index(self, config: IndexConfig):
-        """Get or create the Endee index from IndexConfig."""
+    def setup_index(self, schema: RowSchema):
+        """
+            Creates or gets the Endee index.
+            ALL params come from RowSchema — no hardcoded values, no separate IndexConfig.
+            Role detection done here once — slots cached for fast row conversion.
+        """
+        # FILTER FIELDS VALIDATION
+        if self.filter_fields:
+            metadata_names = {f.name for f in schema.get_metadata_fields()}
+            invalid = self.filter_fields - metadata_names
+            if invalid:
+                logger.error(
+                    f"Invalid filter_fields: {invalid}\n"
+                    f"Available metadata fields: {metadata_names}"
+                )
+                sys.exit(1)
+            logger.info(f"  filter_fields validated: {self.filter_fields}")
+
+        # RESOLVE SLOT POISTIONS
+        pk_field     = schema.get_primary_key()
+        dense_field  = schema.get_dense_vector()
+        sparse_field = schema.get_sparse_vector()
+        meta_fields  = schema.get_metadata_fields()
+
+        # REQUIRED FIELDS
+        if pk_field is None:
+            raise ValueError("RowSchema has no PRIMARY_KEY field — cannot create Endee index")
+        if dense_field is None:
+            raise ValueError("RowSchema has no DENSE_VECTOR field — cannot create Endee index")
+
+        self._pk_slot    = schema.index_of(pk_field.name)
+        self._dense_slot = schema.index_of(dense_field.name)
+
+        # optional: sparse
+        if sparse_field:
+            self._sparse_slot = schema.index_of(sparse_field.name)
+
+        # metadata slots — precomputed for fast lookup in _to_endee
+        for mf in meta_fields:
+            self._payload_slots.append(schema.index_of(mf.name))
+            self._payload_types.append(mf.field_type)
+            self._payload_names.append(mf.name)
+
+        logger.info(f"  Slot map: pk={self._pk_slot}, dense={self._dense_slot}, "
+                    f"sparse={self._sparse_slot}, meta={self._payload_slots}")
+
+        # NO INDEX - CREATE NEW ONE
         try:
             self._index = self._client.get_index(self.index_name)
-            logger.info(f"✓ Index already exists: {self.index_name}")
+            logger.info(f"Index already exists: {self.index_name}")
             return
         except NotFoundException:
             pass
 
         kwargs = dict(
             name       = self.index_name,
-            dimension  = config.dimension,
-            space_type = config.space_type,
-            M          = config.M,
-            ef_con     = config.ef_construct,
-            precision  = config.precision,
+            dimension  = schema.dimension,         # from RowSchema
+            space_type = self.space_type,        # from RowSchema
+            M          = self.M,                 # from RowSchema
+            ef_con     = self.ef_construct,      # from RowSchema
+            precision  = self.precision,         # from RowSchema
         )
 
-        if config.is_hybrid:
-            kwargs["sparse_model"] = config.sparse_model or self.sparse_model
-            logger.info(f"Creating HYBRID index '{self.index_name}' …")
-            logger.info(f"  dense_dim   : {config.dimension}")
-            logger.info(f"  sparse_model: {kwargs['sparse_model']}")
+        if schema.is_hybrid:
+            kwargs["sparse_model"] = schema.sparse_model or self.sparse_model
+            logger.info(f"Creating HYBRID index '{self.index_name}'")
         else:
-            logger.info(f"Creating DENSE index '{self.index_name}' …")
-            logger.info(f"  dimension   : {config.dimension}")
-
-        logger.info(f"  space_type  : {config.space_type}")
-        logger.info(f"  M           : {config.M}")
-        logger.info(f"  ef_construct: {config.ef_construct}")
-        logger.info(f"  precision   : {config.precision}")
+            logger.info(f"Creating DENSE index '{self.index_name}'")
 
         self._client.create_index(**kwargs)
         self._index = self._client.get_index(self.index_name)
-        logger.info(f"✓ Created {'HYBRID' if config.is_hybrid else 'DENSE'} index: {self.index_name}")
+        logger.info(f"Created index: {self.index_name}")
 
     # ── Record conversion ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _to_endee(record: MigrationRecord) -> dict:
-        """Convert canonical MigrationRecord to Endee's native dict format."""
-        d: dict = {
-            "id":     record.id,
-            "vector": record.dense_vector,
-            "filter": record.filter_data,
-            "meta":   record.meta_data,
-        }
-        if record.is_hybrid:
-            d["sparse_indices"] = record.sparse_indices
-            d["sparse_values"]  = record.sparse_values
+
+    def _to_endee(self, record: MigrationRow, schema: RowSchema) -> dict:
+        """ Convert canonical MigrationRecord to Endee's native dict format.
+            Converts MigrationRow to Endee native dict.
+            Uses pre-resolved slot indexes — NO schema lookups per row (fast).
+            Uses FieldRole — NO hardcoded attribute names like row.dense_vector.
+            filter_fields split happens HERE — source never knew about it.
+        """
+        # d: dict = {
+        #     "id":     record.id,
+        #     "vector": record.dense_vector,
+        #     "filter": record.filter_data,
+        #     "meta":   record.meta_data,
+        # }
+        # if record.is_hybrid:
+        #     d["sparse_indices"] = record.sparse_indices
+        #     d["sparse_values"]  = record.sparse_values
+        # return d
+        
+        # primary key
+        d = {"id": str(record.get_field(self._pk_slot))}
+
+        # dense vector
+        d["vector"] = record.get_field(self._dense_slot)
+
+        # sparse vector (hybrid only)
+        if self._sparse_slot >= 0:
+            sp = record.get_field(self._sparse_slot)
+            if sp:
+                d["sparse_indices"] = sp["indices"]
+                d["sparse_values"]  = sp["values"]
+
+        # metadata — split payload into filter and meta
+        filter_data: dict = {}
+        meta_data:   dict = {}
+
+        for slot, ftype, fname in zip(
+            self._payload_slots, self._payload_types, self._payload_names
+        ):
+            value = record.get_field(slot)
+
+            if ftype == FieldType.JSON:
+                # whole payload dict — distribute keys into filter/meta
+                if isinstance(value, dict):
+                    for k, v in value.items():
+                        if k in self.filter_fields:
+                            filter_data[k] = v
+                        else:
+                            meta_data[k] = v
+
+            elif ftype == FieldType.STRING:
+                # individual typed field
+                if fname in self.filter_fields:
+                    filter_data[fname] = value
+                else:
+                    meta_data[fname] = value
+
+            else:
+                # numeric, bool etc. — always metadata
+                meta_data[fname] = value
+
+        d["filter"] = filter_data
+        d["meta"]   = meta_data
+
         return d
 
     # ── Single chunk upsert ───────────────────────────────────────────────────
@@ -155,7 +264,7 @@ class EndeeSink(BaseSink):
 
     # ── upsert_batch ──────────────────────────────────────────────────────────
 
-    async def upsert_batch(self, records: List[MigrationRecord]) -> bool:
+    async def upsert_batch(self, records: List[MigrationRow], schema: RowSchema) -> bool:
         """
         Convert records, split into chunks, upsert all in parallel,
         then retry failures with exponential backoff.
@@ -164,10 +273,10 @@ class EndeeSink(BaseSink):
         Never raises — errors are logged and False is returned.
         """
         t0 = time.time()
-        endee_records = [self._to_endee(r) for r in records]
+        endee_records = [self._to_endee(r, schema) for r in records]
         transform_time = time.time() - t0
         logger.info(
-            f"  [COMMON→ENDEE] {len(endee_records)} records converted "
+            f"  [COMMON->ENDEE] {len(endee_records)} records converted "
             f"in {transform_time:.3f}s"
         )
         chunks = [
@@ -214,6 +323,11 @@ class EndeeSink(BaseSink):
             endee_api_key     = args.target_api_key,
             index_name        = args.target_collection,
             upsert_chunk_size = args.upsert_size,
+            space_type        = args.space_type,
+            M                 = args.M,
+            ef_construct      = args.ef_construct,
+            precision         = args.precision,
+            filter_fields     = args.filter_fields,
         )
 
     def close(self):
