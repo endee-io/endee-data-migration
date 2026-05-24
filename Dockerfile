@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY sources/     /app/sources/
 COPY targets/       /app/targets/
 COPY core/        /app/core/
+COPY constants.py /app/constants.py
 COPY migrate.py /app/migrate.py
 COPY entrypoint.sh /app/entrypoint.sh
 

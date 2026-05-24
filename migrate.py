@@ -1,5 +1,5 @@
 """
-migrate.py  –  Unified CLI entrypoint for all migration types.
+migrate.py  -  Unified CLI entrypoint for all migration types.
 ──────────────────────────────────────────────────────────────────────────────
 
 Usage
@@ -9,8 +9,8 @@ Usage
 
 How the registry works
 ──────────────────────
-    SOURCE_REGISTRY[(from_db, vector_type)]  →  SourceClass
-    SINK_REGISTRY  [(to_db,   vector_type)]  →  SinkClass
+    SOURCE_REGISTRY[(from_db, vector_type)]  -  SourceClass
+    Target_REGISTRY  [(to_db,   vector_type)]  -  TargetClass
 
     Both factories are single dict lookups — no if/elif chains.
     Each class owns its own from_args() classmethod, so this file
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 
 from sources.milvus_source import MilvusDenseSource, MilvusHybridSource
 from sources.qdrant_source import QdrantDenseSource, QdrantHybridSource
-from sinks.endee_sink      import EndeeSink
+from targets.endee_target import EndeeTarget
 
 SOURCE_REGISTRY = {
     ("milvus", "dense"):  MilvusDenseSource,
@@ -68,9 +68,9 @@ SOURCE_REGISTRY = {
     ("qdrant", "hybrid"): QdrantHybridSource,
 }
 
-SINK_REGISTRY = {
-    ("endee", "dense"):  EndeeSink,
-    ("endee", "hybrid"): EndeeSink,
+TARGET_REGISTRY = {
+    ("endee", "dense"):  EndeeTarget,
+    ("endee", "hybrid"): EndeeTarget,
 }
 
 
@@ -94,7 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--to", dest="to_db",
         default=os.getenv("TO_DB"),
-        choices=["endee"],                  # extend when adding new sinks
+        choices=["endee"],                  # extend when adding new Target
         required=not os.getenv("TO_DB"),
         metavar="DB",
         help="Target database type.  Choices: endee",
@@ -178,16 +178,16 @@ def _build_source(args):
     return SourceClass.from_args(args)
 
 
-def _build_sink(args):
+def _build_target(args):
     key = (args.to_db, args.type)
-    SinkClass = SINK_REGISTRY.get(key)
-    if SinkClass is None:
+    TargetClass = TARGET_REGISTRY.get(key)
+    if TargetClass is None:
         logger.error(
-            f"No sink registered for --to={args.to_db} --type={args.type}.\n"
-            f"Registered sinks: {list(SINK_REGISTRY.keys())}"
+            f"No Target registered for --to={args.to_db} --type={args.type}.\n"
+            f"Registered Targets: {list(Target_REGISTRY.keys())}"
         )
         sys.exit(1)
-    return SinkClass.from_args(args)
+    return TargetClass.from_args(args)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -221,10 +221,10 @@ def main():
         checkpoint.clear()
 
     source   = _build_source(args)
-    sink     = _build_sink(args)
+    target     = _build_target(args)
     pipeline = MigrationPipeline(
         source           = source,
-        sink             = sink,
+        target           = target,
         checkpoint       = checkpoint,
         fetch_batch_size = args.batch_size,
         max_queue_size   = args.max_queue_size,
