@@ -207,6 +207,7 @@ class QdrantHybridToEndeeMigrator:
         is_multivector: bool = False,
         M: int = None,
         ef_construct: int = None,
+        space_type: str = None,
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
@@ -226,6 +227,7 @@ class QdrantHybridToEndeeMigrator:
         self.precision = precision
         self.M = M
         self.ef_construct = ef_construct
+        self.space_type = space_type 
         # Clients
         self.qdrant_client = None
         self.endee_client = None
@@ -491,12 +493,26 @@ class QdrantHybridToEndeeMigrator:
         vectors_dimension = dense_vector_config.size
         qdrant_space_type = dense_vector_config.distance
 
-        endee_space_type = QDRANT_TO_ENDEE_SPACE.get(qdrant_space_type)
-        if endee_space_type is None:
-            logger.warning(
-                f"Unknown space type '{qdrant_space_type}', defaulting to cosine"
-            )
-            endee_space_type = "cosine"
+        VALID_SPACE_TYPES = {"cosine", "l2", "ip"}
+
+        if self.space_type is not None:
+            if self.space_type not in VALID_SPACE_TYPES:
+                logger.error(
+                    f"Invalid space_type '{self.space_type}'. "
+                    f"Valid options: {sorted(VALID_SPACE_TYPES)}"
+                )
+                sys.exit(1)
+            endee_space_type = self.space_type
+            logger.info(f"  Space type: user-specified → {endee_space_type}")
+        else:
+            endee_space_type = QDRANT_TO_ENDEE_SPACE.get(qdrant_space_type)
+            if endee_space_type is None:
+                logger.warning(
+                    f"Unknown space type '{qdrant_space_type}' from Qdrant, defaulting to cosine"
+                )
+                endee_space_type = "cosine"
+            else:
+                logger.info(f"  Space type: auto-detected from Qdrant → {endee_space_type}")
 
         sparse_dimension = DEFAULT_SPARSE_DIMENSION
         # =========================================================================================
@@ -969,6 +985,12 @@ def main():
     parser.add_argument("--ef_construct", type=int,
                         default=int(os.getenv("EF_CONSTRUCT")) if os.getenv("EF_CONSTRUCT") else None,
                         help="HNSW ef_construct parameter. Falls back to source collection value if not set.")
+    
+    parser.add_argument(
+        "--space_type",
+        default=os.getenv("SPACE_TYPE", None),
+        help="Vector space type (cosine/l2/ip). Falls back to source collection value, then cosine."
+    )
 
 
     
@@ -1014,6 +1036,7 @@ def main():
         precision=args.precision,
         M=args.M,
         ef_construct=args.ef_construct,
+        space_type=args.space_type,
     )
     
     # Clear checkpoint if requested

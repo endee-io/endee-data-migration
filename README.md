@@ -1,6 +1,6 @@
 # Endee Migration Tool - Documentation
 
-Migrate vector data from **Qdrant** or **Milvus** into **Endee**. The tool ships as a Docker image and supports dense-only and hybrid (dense + sparse) collections.
+Migrate vector data from **Qdrant** / **Milvus** / **Chromadb** into **Endee**. The tool ships as a Docker image and supports dense-only and hybrid (dense + sparse) collections.
 
 ---
 
@@ -38,12 +38,18 @@ MIGRATION_TYPE=milvus-to-endee-dense
 SOURCE_URL=http://<milvus-server-ip>
 SOURCE_PORT=19530
 SOURCE_COLLECTION=my_collection # SOURCE DATABASE COLLECTION NAME FROM WHERE DATA NEEDS TO MIGRATE
+SOURCE_DB=default # FOR MILVUS
 TARGET_URL=http://<endee-server-ip>:8080 # IP OF ENDEE SERVER RUNNING ON
 TARGET_API_KEY=your-endee-api-key # IF USING ENDEE DEV SERVER GET THE API KEY (NO NEED TO SET TARGET URL IN THAT CASE )
 TARGET_COLLECTION=my_index # ENDEE INDEX NAME
-CLEAR_CHECKPOINT=true # FALSE IF YOU WANT TO RESUME THE MIGRATION
+RESUME=false # true IF YOU WANT TO RESUME THE MIGRATION
 FILTER_FIELDS=field1,field2 # ADD FILTER_FIELDS ONLY IF YOU WANT FIELDS TO BE IN ENDEE FILTER AND NOT IN META
-PRECISION=INT16 
+PRECISION=INT16
+SPACE_TYPE=cosine # DISTANCE METRIC: cosine | l2 | ip
+PRECISION=int16
+M=16
+EF_CONSTRUCT=128
+SPACE_TYPE=cosine
 ```
 
 
@@ -60,7 +66,7 @@ chmod +x cmd.sh
 ```
 
 Make sure:
-- Port `6333` (Qdrant) or `19530` (Milvus) is open on the source server.
+- Port `6333` (Qdrant) or `19530` (Milvus) or `8000` (Chroma) is open on the source server.
 - The Endee API port is open on the Endee server.
 - The migration container has outbound access to both.
 
@@ -80,6 +86,7 @@ Make sure:
 | `TARGET_COLLECTION` | Required | Name of the Endee index to create or write into. Created automatically if it does not exist. | `my_index` |
 | `FILTER_FIELDS` | Optional | Comma-separated fields to store in Endee's `filter` slot for fast filtering. All other fields go to `meta`. Leave blank to put everything in `meta`. | `category,status,year` |
 | `PRECISION` | Required | Vector storage precision in Endee. Explicitly setting it is recommended. See precision table below. | `INT16` |
+| `SPACE_TYPE` | Required | Distance metric for the Endee index. Must match the metric used when the source collection was built. | `cosine` |
 | `IS_MULTIVECTOR` | Do not change | Reserved for future use. Multivector mode is not currently supported. Always leave as `false`. | `false` |
 | `M` | Required | Number of bidirectional links per node in the HNSW graph. Higher = better recall but slower inserts and more memory. Auto-read from source collection if not set. Cannot be zero or negative. | `16` |
 | `EF_CONSTRUCT` | Required | Search beam width during index construction. Higher = better graph quality but slower inserts. Auto-read from source collection if not set. Cannot be zero or negative. | `128` |
@@ -90,19 +97,9 @@ Make sure:
 | `CHECKPOINT_FILE` | Do not change | Path inside the container where progress is saved after every successful batch. Changing this breaks the resume feature. | `/app/data/checkpoints/migration.json` |
 | `DEBUG` | Do Not Change | `true` to enable verbose debug logging. Leave `false` in normal operation. | `false` |
 
+
 **Available `MIGRATION_TYPE` values:**
 
-| Value | Source | Vector Mode |
-|---|---|---|
-| `milvus-to-endee-dense` | Milvus | Dense vectors only |
-| `milvus-to-endee-hybrid` | Milvus | Dense + sparse vectors |
-| `qdrant-to-endee-dense` | Qdrant | Dense vectors only |
-| `qdrant-to-endee-hybrid` | Qdrant | Named dense (`dense`) + sparse (`sparse_keywords`) vectors |
-
-
-## Running the Migration
-
-### Available Migration Types
 
 | Type | Source | Vector Mode |
 |---|---|---|
@@ -110,8 +107,11 @@ Make sure:
 | `milvus-to-endee-hybrid` | Milvus | Dense + sparse vectors |
 | `qdrant-to-endee-dense` | Qdrant | Dense vectors only |
 | `qdrant-to-endee-hybrid` | Qdrant | Named dense (`dense`) + sparse (`sparse_keywords`) vectors |
+| `chroma-to-endee-hybrid` | ChromaDB | Dense -> Hybrid (BM25 sparse generated via `endee/bm25`) |
 
-Pass the type as the first argument to the container, or set `MIGRATION_TYPE` in your `.env`.
+Set `MIGRATION_TYPE` in your `.env`.
+> **Note:** ChromaDB hybrid migration requires document text to be stored alongside embeddings in the source collection. If documents are missing, sparse BM25 vectors cannot be generated and the migration will exit with an error.
+
 
 ### Override precision manually
 | Item | Value / Options | When to use |
@@ -121,26 +121,41 @@ Pass the type as the first argument to the container, or set `MIGRATION_TYPE` in
 | Recommended option | `INT16` | Good balance of accuracy and storage efficiency when source has no explicit quantization |
 | Full precision option | `FLOAT32` | Preserve full original precision |
 
+### Override Space Type (`SPACE_TYPE`)
+
+`SPACE_TYPE` is **required** for all migration types. It sets the distance metric of the Endee index.
+
+| Value | Distance metric | When to use |
+|---|---|---|
+| `cosine` | Cosine similarity | Default for most embedding models; ChromaDB default |
+| `l2` | Euclidean (L2) distance | Use when source collection was built with L2 |
+| `ip` | Inner product | Use when source collection was built with dot-product / inner-product |
+
 
 ### Checkpoint and Resume
 
 | Item | Details |
 |---|---|
 | Checkpoint behavior | The script saves progress to a JSON file after every successful batch. |
-| Resume behavior | If migration is interrupted (network error, container restart, manual stop), re-run the same command with `--clear_checkpoint=False` to continue from the last saved point. |
+| Resume behavior | If migration is interrupted (network error, container restart, manual stop), re-run the same command with `Resume=true` to continue from the last saved point. |
 | Checkpoint path (container) | `/app/data/checkpoints/migration.json` |
 | Checkpoint path (host) | `./data/checkpoints/migration.json` |
 | Volume mount required | `-v $(pwd)/data:/app/data` |
+
+
+
+---
 
 ### FILTER FIELDS
 | Source | Input fields | `FILTER_FIELDS` setting | Endee `filter` | Endee `meta` |
 |---|---|---|---|---|
 | Qdrant | Payload fields | Not set | Empty | All payload fields |
 | Milvus | Metadata fields | Not set | Empty | All metadata fields |
-| Qdrant / Milvus | Payload (Qdrant) / Metadata (Milvus) | Set (for example: `category,status,year`) | Only fields listed in `FILTER_FIELDS` | Remaining fields not listed in `FILTER_FIELDS` |
+| ChromaDB | Metadata fields | Not set | Empty | All metadata fields + optional `document` text |
+| Qdrant / Milvus / ChromaDB | Payload or metadata | Set (for example: `category,status,year`) | Only fields listed in `FILTER_FIELDS` | Remaining fields not listed in `FILTER_FIELDS` |
 ---
 
-### Qdrant → Endee record field mapping
+### Qdrant -> Endee record field mapping
 
 
 | Qdrant concept | Endee field | Mapping |
@@ -165,6 +180,24 @@ Rows are built in `convert_records` in the Milvus migration scripts. Schema dete
 
 ---
 
+### ChromaDB → Endee record field mapping
+
+Rows are built in `_convert_batch` in the ChromaDB migration script. Sparse vectors are generated from document text using Endee's own BM25 model (`endee/bm25`) via the `endee-model` package — this is the only encoder compatible with indexes created with `sparse_model="endee_bm25"`.
+
+| ChromaDB concept | Endee field | Mapping |
+|---|---|---|
+| Record ID | `id` | `str(doc_id)` |
+| Embedding | `vector` | Dense embedding stored in the ChromaDB collection. Records with no embedding are skipped with a warning. |
+| Document text | `sparse_indices`, `sparse_values` | BM25 sparse encoding via `SparseModel("endee/bm25").embed(documents)`. Records with no document text in the entire batch cause the migration to abort. |
+| Document text | `meta["document"]` | Stored in `meta` alongside other metadata unless `--no-store-document` / `NO_STORE_DOCUMENT=true` is set. |
+| Metadata fields | `filter`, `meta` | Keys listed in `FILTER_FIELDS` go to `filter`; every other metadata key goes to `meta`. If `FILTER_FIELDS` is unset, all metadata goes to `meta` and `filter` is `{}`. |
+
+> **Space type for ChromaDB:** ChromaDB does not expose the collection distance metric in a reliably accessible way, so `SPACE_TYPE` must always be set explicitly for this migration type. Use the same metric you used when building the collection (`cosine` is the ChromaDB default).
+
+---
+
+
+
 ### Precision Milvus and Endee DataType Mapping
 ---
 
@@ -187,6 +220,7 @@ Rows are built in `convert_records` in the Milvus migration scripts. Schema dete
 | `product` present | Not supported | Migration raises an error |
 | `binary` with `query_encoding` | Not supported | Asymmetric quantization raises an error |
 | `binary` with explicit `encoding` | Not supported | Invalid encoding raises an error |
+
 
 ---
 Note: The script exits if quantization is not configured in the environment variables.

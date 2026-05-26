@@ -204,6 +204,7 @@ class SimpleQdrantToEndeeMigrator:
         max_queue_size: int = DEFAULT_MAX_QUEUE_SIZE,
         M: int = None,
         ef_construct: int = None,
+        space_type:str = None,
     ):
         self.qdrant_url = qdrant_url
         self.qdrant_port = qdrant_port
@@ -228,6 +229,7 @@ class SimpleQdrantToEndeeMigrator:
         self._stop_event = None
         self.M = M
         self.ef_construct = ef_construct
+        self.space_type = space_type
 
         # Statistics
         self.stats = {
@@ -452,13 +454,27 @@ class SimpleQdrantToEndeeMigrator:
             vectors_map = {}
         
         vectors_dimension = collection_info.config.params.vectors.size
-        qdrant_space_type = collection_info.config.params.vectors.distance
-        endee_space_type = QDRANT_TO_ENDEE_SPACE.get(qdrant_space_type)
-        if endee_space_type is None:
-            logger.warning(
-                f"Unknown space type '{qdrant_space_type}', defaulting to cosine"
-            )
-            endee_space_type = "cosine"
+        VALID_SPACE_TYPES = {"cosine", "l2", "ip"}
+
+        if self.space_type is not None:
+            if self.space_type not in VALID_SPACE_TYPES:
+                logger.error(
+                    f"Invalid space_type '{self.space_type}'. "
+                    f"Valid options: {sorted(VALID_SPACE_TYPES)}"
+                )
+                sys.exit(1)
+            endee_space_type = self.space_type
+            logger.info(f"  Space type: user-specified → {endee_space_type}")
+        else:
+            qdrant_space_type = collection_info.config.params.vectors.distance
+            endee_space_type = QDRANT_TO_ENDEE_SPACE.get(qdrant_space_type)
+            if endee_space_type is None:
+                logger.warning(
+                    f"Unknown space type '{qdrant_space_type}' from Qdrant, defaulting to cosine"
+                )
+                endee_space_type = "cosine"
+            else:
+                logger.info(f"  Space type: auto-detected from Qdrant → {endee_space_type}")
 
         
         for _, config in vectors_map.items():
@@ -802,6 +818,11 @@ def main():
     parser.add_argument("--ef_construct", type=int,
                         default=int(os.getenv("EF_CONSTRUCT")) if os.getenv("EF_CONSTRUCT") else None,
                         help="HNSW ef_construct parameter. Falls back to source collection value if not set.")
+    parser.add_argument(
+            "--space_type",
+            default=os.getenv("SPACE_TYPE", None),
+            help="Vector space type (cosine/l2/ip). Falls back to source collection value, then cosine."
+        )
     # Debug
     parser.add_argument("--debug", action="store_true", 
                        default=os.getenv("DEBUG",False),
@@ -857,6 +878,7 @@ def main():
         is_multivector=args.is_multivector,
         M=args.M,
         ef_construct=args.ef_construct,
+        space_type=args.space_type,
     )
     
     # Clear checkpoint if requested
