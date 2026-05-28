@@ -85,7 +85,10 @@ class RowSchema:
     fields: List[FieldSchema]
 
     # # --- INDEX CREATION PARAMS ( FROM SOURCE, REPACES INDEXCONFIG ) ---
-    # space_type:   str
+    space_type:   str
+    dimension :   int
+    is_hybrid :   bool  
+
     # M:            int
     # ef_construct: int
     # precision:    Optional[Any]
@@ -152,14 +155,14 @@ class RowSchema:
     def total_fields(self) -> int:
         return len(self.fields)
 
-    @property
-    def is_hybrid(self) -> bool:
-        return self.get_sparse_vector() is not None
+    # @property
+    # def is_hybrid(self) -> bool:
+    #     return self.get_sparse_vector() is not None
 
-    @property
-    def dimension(self) -> Optional[int]:
-        dense = self.get_dense_vector()
-        return dense.dimension if dense else None
+    # @property
+    # def dimension(self) -> Optional[int]:
+    #     dense = self.get_dense_vector()
+    #     return dense.dimension if dense else None
 
 
 # ── The actual row data ─────────────────────────────────────────────────────────
