@@ -45,16 +45,20 @@ class MigrationPipeline:
         initial_cursor = self.checkpoint.get_last_cursor()
         logger.info("PRODUCER: started")
         try:
-            async for records, next_cursor in self.source.iterate_batches(
+            async for records, next_cursor, src_timings in self.source.iterate_batches(
                 self.fetch_batch_size, initial_cursor, self._schema
             ):
                 if self.interrupted or self._stop_event.is_set():
                     logger.info("PRODUCER: stop requested — exiting loop")
                     break
                 self.stats["fetched"] += len(records)
-                logger.info(f"[Batch {batch_number}] Fetched {len(records)} records")
-                await queue.put({"batch_number": batch_number, "records": records,
-                                 "next_cursor": next_cursor, "enqueue_time": time.time()})
+                await queue.put({
+                    "batch_number": batch_number,
+                    "records":      records,
+                    "next_cursor":  next_cursor,
+                    "src_timings":  src_timings,
+                    "enqueue_time": time.time(),
+                })
                 if self._stop_event.is_set():
                     logger.warning("PRODUCER: stop event set after queue.put()")
                     break
@@ -80,22 +84,34 @@ class MigrationPipeline:
                     self.checkpoint.mark_completed()
                     logger.info("CONSUMER: migration marked as completed in checkpoint")
                 break
-            batch_number  = batch["batch_number"]
-            records       = batch["records"]
-            next_cursor   = batch["next_cursor"]
-            queue_wait    = time.time() - batch["enqueue_time"]
-            logger.info(f"CONSUMER: upserting batch {batch_number} ({len(records)} records, wait={queue_wait:.2f}s)")
-            t0 = time.time()
-            success = await self.target.upsert_batch(records, self._schema)
-            upsert_time = time.time() - t0
+            batch_number = batch["batch_number"]
+            records      = batch["records"]
+            next_cursor  = batch["next_cursor"]
+            src_timings  = batch.get("src_timings", {})
+
+            success, tgt_timings = await self.target.upsert_batch(records, self._schema)
+
+            fetch_time     = src_timings.get("fetch", 0.0)
+            src_transform  = src_timings.get("src_transform", 0.0)
+            tgt_transform  = tgt_timings.get("tgt_transform", 0.0)
+            upsert_time    = tgt_timings.get("upsert", 0.0)
+            total_time     = fetch_time + src_transform + tgt_transform + upsert_time
+
             if success:
                 self.checkpoint.update(batch_number, len(records), next_cursor)
                 self.stats["upserted"] += len(records)
                 self.stats["batches_processed"] += 1
                 pbar.update(len(records))
                 queue.task_done()
-                throughput = len(records) / upsert_time if upsert_time > 0 else 0
-                logger.info(f"[Batch {batch_number}] ✓ {len(records)} records | upsert={upsert_time:.2f}s | {throughput:.1f} rec/s")
+                throughput = len(records) / total_time if total_time > 0 else 0
+                logger.info(
+                    f"[Batch {batch_number}] {len(records)} records | "
+                    f"fetch={fetch_time:.2f}s | "
+                    f"src→common={src_transform:.3f}s | "
+                    f"common→endee={tgt_transform:.3f}s | "
+                    f"upsert={upsert_time:.2f}s | "
+                    f"{throughput:.1f} rec/s"
+                )
             else:
                 self.stats["failed"] += len(records)
                 logger.error(f"[Batch {batch_number}] ✗ failed after retries — stopping")

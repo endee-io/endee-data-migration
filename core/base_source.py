@@ -12,7 +12,7 @@ Nothing else in the codebase needs to change.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, List, Tuple, TYPE_CHECKING, AsyncGenerator
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING, AsyncGenerator
 from .schema import RowSchema, MigrationRow
 
 # if TYPE_CHECKING:
@@ -75,7 +75,7 @@ class BaseSource(ABC):
         batch_size: int,
         initial_cursor: Any,
         schema: RowSchema,
-    ) -> AsyncGenerator[Tuple[List[MigrationRow], Any], None]:
+    ) -> AsyncGenerator[Tuple[List[MigrationRow], Any, Dict[str, float]], None]:
         """
         Async generator.
 

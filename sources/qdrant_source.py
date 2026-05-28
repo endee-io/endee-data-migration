@@ -318,10 +318,11 @@ class QdrantBaseSource(BaseSource):
 
     # ── Record conversion ─────────────────────────────────────────────────────
 
-    def _convert_records(self, points) -> List[MigrationRow]:
+    def _convert_records(self, points) -> Tuple[List[MigrationRow], float]:
         """
-            Converts Qdrant points to MigrationRow.
-            Fills slots POSITIONALLY — matches order in RowSchema.fields.
+        Converts Qdrant points to MigrationRow.
+        Fills slots POSITIONALLY — matches order in RowSchema.fields.
+        Returns (rows, transform_time_seconds).
         """
         t0 = time.time()
         schema = self._schema
@@ -341,7 +342,7 @@ class QdrantBaseSource(BaseSource):
                     dense = vec_data
                 row.set_field(self._dense_slot, dense)
 
-                # SLOT-2 (IF HYBRI): sparse vector as {indices, values}
+                # SLOT-2 (IF HYBRID): sparse vector as {indices, values}
                 if self._sparse_slot >= 0 and isinstance(vec_data, dict):
                     sparse_raw = vec_data.get(self._sparse_field_name)
                     if sparse_raw is not None:
@@ -358,7 +359,7 @@ class QdrantBaseSource(BaseSource):
                 logger.error(f"Error converting point {pt.id}: {e}")
                 logger.error(traceback.format_exc())
                 continue
-        return rows
+        return rows, time.time() - t0
 
         #         vec_data = pt.vector
         #         if isinstance(vec_data, dict):
@@ -441,21 +442,25 @@ class QdrantBaseSource(BaseSource):
 
         Cursor: scroll offset (UUID string or None).
         initial_cursor=None means start from the beginning.
-        Yields: (List[MigrationRecord], next_cursor)
+        Yields: (List[MigrationRow], next_cursor, {"fetch": float, "src_transform": float})
         """
         loop   = asyncio.get_running_loop()
-        offset = initial_cursor   # None = start of collection
+        offset = initial_cursor
 
         logger.info(f"PRODUCER: starting Qdrant scroll from offset={offset}")
 
         while True:
+            t_fetch = time.time()
             points_batch, next_offset = await self._scroll(offset, batch_size, loop)
+            fetch_time = time.time() - t_fetch
 
             if not points_batch:
                 logger.info("PRODUCER: no more data from Qdrant")
                 return
 
-            yield self._convert_records(points_batch), next_offset
+            rows, transform_time = self._convert_records(points_batch)
+
+            yield rows, next_offset, {"fetch": fetch_time, "src_transform": transform_time}
 
             if next_offset is None:
                 logger.info("PRODUCER: reached end of Qdrant collection (next_offset=None)")
