@@ -12,7 +12,7 @@ Nothing else in the codebase needs to change.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, List, TYPE_CHECKING
+from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 from .schema import RowSchema, MigrationRow
 # if TYPE_CHECKING:
 #     from .record import MigrationRecord, IndexConfig
@@ -54,7 +54,7 @@ class BaseTarget(ABC):
         """
 
     @abstractmethod
-    async def upsert_batch(self, records: List[MigrationRow]) -> bool:
+    async def upsert_batch(self, records: List[MigrationRow]) -> Tuple[bool, Dict[str, float]]:
         """
         Write a batch of canonical records to the target.
 

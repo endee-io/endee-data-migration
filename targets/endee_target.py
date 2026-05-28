@@ -25,7 +25,7 @@ import asyncio
 import logging
 import sys
 import urllib.parse
-from typing import Any, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from endee import Endee
 from endee.exceptions import NotFoundException
@@ -271,25 +271,26 @@ class EndeeTarget(BaseTarget):
 
     # ── upsert_batch ──────────────────────────────────────────────────────────
 
-    async def upsert_batch(self, records: List[MigrationRow], schema: RowSchema) -> bool:
+    async def upsert_batch(
+        self, records: List[MigrationRow], schema: RowSchema
+    ) -> Tuple[bool, Dict[str, float]]:
         """
         Convert records, split into chunks, upsert all in parallel,
         then retry failures with exponential backoff.
 
-        Returns True on full success, False if any chunk exhausts retries.
+        Returns (success, {"tgt_transform": float, "upsert": float}).
         Never raises — errors are logged and False is returned.
         """
         t0 = time.time()
         endee_records = [self._to_endee(r, schema) for r in records]
         transform_time = time.time() - t0
-        logger.info(
-            f"  [COMMON->ENDEE] {len(endee_records)} records converted "
-            f"in {transform_time:.3f}s"
-        )
+
         chunks = [
             endee_records[i: i + self.upsert_chunk_size]
             for i in range(0, len(endee_records), self.upsert_chunk_size)
         ]
+
+        t1 = time.time()
 
         # Phase 1: all chunks in parallel
         results = await asyncio.gather(
@@ -318,9 +319,9 @@ class EndeeTarget(BaseTarget):
                     await asyncio.sleep(wait)
             if not succeeded:
                 logger.error(f"  Chunk of {len(chunk)} records failed after 3 retries")
-                return False
+                return False, {"tgt_transform": transform_time, "upsert": time.time() - t1}
 
-        return True
+        return True, {"tgt_transform": transform_time, "upsert": time.time() - t1}
 
 
     @classmethod
