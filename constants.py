@@ -37,7 +37,7 @@ QDRANT_SPARSE_VECTOR_NAME = "sparse_keywords"
 DEFAULT_SPARSE_MODEL = "default"
 
 # API paths
-ENDEE_V1_API = "/api/v1/"
+ENDEE_V1_API = "/api/v1"
 
 # Default values
 DEFAULT_SPACE_TYPE = "cosine"

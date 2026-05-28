@@ -43,6 +43,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# import debugpy
+# if os.getenv('DEBUG_REMOTE') == '1':
+#     debugpy.listen(("0.0.0.0", 5678))
+#     print("Waiting for debugger to attach on port 5678...")
+#     debugpy.wait_for_client()  # Script pauses here until you attach
+#     print("Debugger attached!")
 
 # ── Registries ────────────────────────────────────────────────────────────────
 # Key: (database_name, vector_type)
@@ -184,7 +190,7 @@ def _build_target(args):
     if TargetClass is None:
         logger.error(
             f"No Target registered for --to={args.to_db} --type={args.type}.\n"
-            f"Registered Targets: {list(Target_REGISTRY.keys())}"
+            f"Registered Targets: {list(TARGET_REGISTRY.keys())}"
         )
         sys.exit(1)
     return TargetClass.from_args(args)

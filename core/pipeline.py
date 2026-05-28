@@ -9,7 +9,6 @@ from .base_source import BaseSource
 from .base_target import BaseTarget
 from .checkpoint  import MigrationCheckpoint
 from .schema import RowSchema
-
 logger = logging.getLogger(__name__)
 
 
@@ -130,6 +129,8 @@ class MigrationPipeline:
 
         # ── step 2: source builds schema (the contract for the whole pipeline) ─
         self._schema = self.source.detect_schema()
+
+        print("schema: ", self._schema, type(self._schema))
         logger.info(f"Schema built: {[f.name for f in self._schema.fields]}")
         logger.info(f"  dimension={self._schema.dimension}, "
                     f"space={self._schema.space_type}, "

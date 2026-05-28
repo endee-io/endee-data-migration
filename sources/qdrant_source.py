@@ -174,7 +174,7 @@ class QdrantBaseSource(BaseSource):
                 https=bool(self.use_https),
             )
             self.qdrant_client.get_collections()
-            logger.info("✓ Connected to Qdrant")
+            logger.info("Connected to Qdrant")
         except Exception as e:
             logger.error(f"Failed to connect to Qdrant: {e}")
             sys.exit(1)
@@ -233,7 +233,7 @@ class QdrantBaseSource(BaseSource):
         #     self._space_override
         #     or QDRANT_TO_ENDEE_SPACE.get(qdrant_space, "cosine")
         # )
-        logger.info(f"  [DENSE]  field='{self.dense_field_name}', dim={self.dimension}, space={qdrant_space}")
+        logger.info(f"  [DENSE]  field='{self._dense_field_name}', dim={self.dimension}, space={qdrant_space}")
 
         # ── SLOT 2 : SPARSE FIELD  ───────────────────────────────────────────────
         sparse_vectors = params.sparse_vectors
@@ -294,11 +294,14 @@ class QdrantBaseSource(BaseSource):
         # Subclass validates sparse presence/absence
         self._schema = RowSchema(
             fields = schema_fields,
+            dimension= self.dimension,
+            space_type= qdrant_space,
+            is_hybrid= False if self._sparse_slot is -1 else True
         )
-        self._validate_schema(vectors, sparse_vectors)
+        self._validate_schema(sparse_vectors)
         return self._schema
 
-    def _validate_schema(self, vectors, sparse_vectors):
+    def _validate_schema(self,  sparse_vectors):
         """Override in subclass."""
 
     # ── Index config ──────────────────────────────────────────────────────────
@@ -355,11 +358,6 @@ class QdrantBaseSource(BaseSource):
                 logger.error(f"Error converting point {pt.id}: {e}")
                 logger.error(traceback.format_exc())
                 continue
-            transform_time = time.time() - t0
-            logger.info(
-                f"  [SOURCE-COMMON] {len(rows)}/{len(points)} records converted "
-                f"in {transform_time:.3f}s"
-            )
         return rows
 
         #         vec_data = pt.vector

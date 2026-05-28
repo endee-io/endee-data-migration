@@ -99,8 +99,15 @@ class EndeeTarget(BaseTarget):
             url = urllib.parse.urljoin(self.endee_url, ENDEE_V1_API)
             self._client.set_base_url(url)
             logger.info(f"  Base URL: {url}")
-        logger.info(f"  Available indexes: {self._client.list_indexes()}")
-        logger.info("✓ Connected to Endee")
+
+        # ── DEBUG: smoke-test before proceeding ──
+        try:
+            indexes = self._client.list_indexes()
+            logger.info(f"  Reachable — indexes: {indexes}")
+        except Exception as e:
+            logger.error(f"  Endee unreachable after connect: {e}")
+            raise
+        logger.info("Connected to Endee")
 
     # ── setup_index ───────────────────────────────────────────────────────────
 
@@ -128,6 +135,7 @@ class EndeeTarget(BaseTarget):
         sparse_field = schema.get_sparse_vector()
         meta_fields  = schema.get_metadata_fields()
 
+        self.dimension = dense_field.dimension
         # REQUIRED FIELDS
         if pk_field is None:
             raise ValueError("RowSchema has no PRIMARY_KEY field — cannot create Endee index")
@@ -147,7 +155,7 @@ class EndeeTarget(BaseTarget):
             self._payload_types.append(mf.field_type)
             self._payload_names.append(mf.name)
 
-        logger.info(f"  Slot map: pk={self._pk_slot}, dense={self._dense_slot}, "
+        logger.info(f"  Slot map: id={self._pk_slot}, dense={self._dense_slot}, "
                     f"sparse={self._sparse_slot}, meta={self._payload_slots}")
 
         # NO INDEX - CREATE NEW ONE
@@ -160,15 +168,14 @@ class EndeeTarget(BaseTarget):
 
         kwargs = dict(
             name       = self.index_name,
-            dimension  = schema.dimension,         # from RowSchema
+            dimension  = self.dimension,         
             space_type = self.space_type,        # from RowSchema
             M          = self.M,                 # from RowSchema
             ef_con     = self.ef_construct,      # from RowSchema
             precision  = self.precision,         # from RowSchema
         )
-
         if schema.is_hybrid:
-            kwargs["sparse_model"] = schema.sparse_model or self.sparse_model
+            kwargs["sparse_model"] = self.sparse_model
             logger.info(f"Creating HYBRID index '{self.index_name}'")
         else:
             logger.info(f"Creating DENSE index '{self.index_name}'")
@@ -328,6 +335,7 @@ class EndeeTarget(BaseTarget):
             ef_construct      = args.ef_construct,
             precision         = args.precision,
             filter_fields     = args.filter_fields,
+            sparse_model      = getattr(args, "sparse_model", DEFAULT_SPARSE_MODEL)
         )
 
     def close(self):
