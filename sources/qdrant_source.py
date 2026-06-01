@@ -43,10 +43,10 @@ logger = logging.getLogger(__name__)
 #     Distance.DOT:    "ip",
 # }
 
-# # ── Precision helpers ─────────────────────────────────────────────────────────
-PRECISION_STR_TO_ENDEE: Dict[str, Any] = {}
-PRECISION_RANK:         Dict[Any, int]  = {}
-PRECISION_NAMES:        Dict[Any, str]  = {}
+# # # ── Precision helpers ─────────────────────────────────────────────────────────
+# PRECISION_STR_TO_ENDEE: Dict[str, Any] = {}
+# PRECISION_RANK:         Dict[Any, int]  = {}
+# PRECISION_NAMES:        Dict[Any, str]  = {}
 
 # def _fill_precision_maps():
 #     if PRECISION_STR_TO_ENDEE:
@@ -193,15 +193,15 @@ class QdrantBaseSource(BaseSource):
         params = info.config.params
         schema_fields: List[FieldSchema] = []
 
-        #=============>  SLOT 0 - ID ALWAYS PRESENT IN QDRANT 
+        # SLOT 0 - ID ALWAYS PRESENT IN QDRANT 
         schema_fields.append(FieldSchema(
             name = 'id',
             field_type = FieldType.STRING,
             role = FieldRole.ID
         ))
 
-        #=============>  SLOT 1 - DENSE VECTORS
-        # ── DETECT DENSE FIELDS  ────────────────────────────────────────────────
+        # SLOT 1 - DENSE VECTORS
+        #  DETECT DENSE FIELDS  
         vectors = params.vectors
         if isinstance(vectors, dict):
             # Named vectors - find first with a .size

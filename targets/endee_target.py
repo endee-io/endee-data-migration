@@ -35,6 +35,7 @@ from core.base_target import BaseTarget
 from core.schema import FieldRole, FieldType, MigrationRow, RowSchema
 import time
 from constants import DEFAULT_SPARSE_MODEL, ENDEE_V1_API
+from core.type_registry import resolve_space, ENDEE_SPACE_MAPPING
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ class EndeeTarget(BaseTarget):
         self.index_name       = index_name
         self.upsert_chunk_size = upsert_chunk_size
         self.sparse_model     = sparse_model
-        self.space_type        = space_type
+        self.space_type        = resolve_space(ENDEE_SPACE_MAPPING, space_type)
         self.M                 = M
         self.ef_construct      = ef_construct
         self.precision         = precision
@@ -194,16 +195,6 @@ class EndeeTarget(BaseTarget):
             Uses FieldRole — NO hardcoded attribute names like row.dense_vector.
             filter_fields split happens HERE — source never knew about it.
         """
-        # d: dict = {
-        #     "id":     record.id,
-        #     "vector": record.dense_vector,
-        #     "filter": record.filter_data,
-        #     "meta":   record.meta_data,
-        # }
-        # if record.is_hybrid:
-        #     d["sparse_indices"] = record.sparse_indices
-        #     d["sparse_values"]  = record.sparse_values
-        # return d
         
         # primary key
         d = {"id": str(record.get_field(self._pk_slot))}
