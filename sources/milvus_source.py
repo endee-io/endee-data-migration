@@ -43,27 +43,28 @@ from pymilvus import MilvusException
 
 from core.base_source import BaseSource
 from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
+from core.type_registry import MILVUS_DTYPE_TO_PRECISION, MILVUS_METRIC_TO_SPACE
 
 logger = logging.getLogger(__name__)
 
-# ── Milvus vector dtype → human-readable name (logging only) ─────────────────
-MILVUS_DTYPE_TO_PREC_NAME = {
-    DataType.FLOAT_VECTOR:    "float32",
-    DataType.FLOAT16_VECTOR:  "float16",
-    DataType.BINARY_VECTOR:   "binary",
-}
-MILVUS_STR_TO_PREC_NAME = {
-    "FLOAT_VECTOR":    "float32",
-    "FLOAT16_VECTOR":  "float16",
-    "BINARY_VECTOR":   "binary",
-}
+# # ── Milvus vector dtype → human-readable name (logging only) ─────────────────
+# MILVUS_DTYPE_TO_PREC_NAME = {
+#     DataType.FLOAT_VECTOR:    "float32",
+#     DataType.FLOAT16_VECTOR:  "float16",
+#     DataType.BINARY_VECTOR:   "binary",
+# }
+# MILVUS_STR_TO_PREC_NAME = {
+#     "FLOAT_VECTOR":    "float32",
+#     "FLOAT16_VECTOR":  "float16",
+#     "BINARY_VECTOR":   "binary",
+# }
 
-# ── Milvus metric type → normalised space_type string ────────────────────────
-MILVUS_METRIC_TO_SPACE = {
-    "COSINE": "cosine",
-    "L2":     "l2",
-    "IP":     "ip",
-}
+# # ── Milvus metric type → normalised space_type string ────────────────────────
+# MILVUS_METRIC_TO_SPACE = {
+#     "COSINE": "cosine",
+#     "L2":     "l2",
+#     "IP":     "ip",
+# }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
