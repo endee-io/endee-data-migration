@@ -33,7 +33,7 @@ from qdrant_client.http.models import Distance
 
 from core.base_source import BaseSource
 from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
-
+from core.type_registry import QDRANT_TO_CANONICAL_PRECISION_MAPPING, QDRANT_TO_CANONICAL_SPACE_TYPE, resolve_precision, resolve_space
 logger = logging.getLogger(__name__)
 
 # ── Space-type mapping ────────────────────────────────────────────────────────
@@ -228,11 +228,21 @@ class QdrantBaseSource(BaseSource):
         ))
         self._dense_slot = 1
 
+        # ── Resolve space type ────────────────────────────────────────────────
+        # qdrant_space is a Distance enum — .value gives "Cosine", "Euclid" etc.
+        canonical_space = resolve_space(
+            QDRANT_TO_CANONICAL_SPACE_TYPE,
+            qdrant_space.value   # "Cosine" → normalised to "cosine" inside resolve_space
+        )
 
-        # self.space_type = (
-        #     self._space_override
-        #     or QDRANT_TO_ENDEE_SPACE.get(qdrant_space, "cosine")
-        # )
+        # ── Resolve precision from quantization_config ────────────────────────
+        qcfg = info.config.quantization_config
+        precision_key = self._extract_qdrant_precision_key(qcfg)
+        canonical_precision = resolve_precision(
+            QDRANT_TO_CANONICAL_PRECISION_MAPPING,
+            precision_key
+        )
+
         logger.info(f"  [DENSE]  field='{self._dense_field_name}', dim={self.dimension}, space={qdrant_space}")
 
         # ── SLOT 2 : SPARSE FIELD  ───────────────────────────────────────────────
@@ -257,46 +267,12 @@ class QdrantBaseSource(BaseSource):
         ))
         self._payload_slot = len(schema_fields) - 1
 
-        # ── HNSW params ───────────────────────────────────────────────────────
-        # source_M  = info.config.hnsw_config.m
-        # source_ef = info.config.hnsw_config.ef_construct
-        # self.M            = self._user_M            if self._user_M            is not None else source_M
-        # self.ef_construct = self._user_ef_construct if self._user_ef_construct is not None else source_ef
-        # logger.info(f"  HNSW: M={self.M}, ef_construct={self.ef_construct}")
-
-        # # ── Quantization - precision ──────────────────────────────────────────
-        # from endee import Precision
-        # if info.config.quantization_config:
-        #     qcfg = dict(info.config.quantization_config)
-        #     if "scalar" in qcfg:
-        #         source_prec = Precision.INT8
-        #     elif "binary" in qcfg:
-        #         binary_cfg = qcfg.get("binary", {})
-        #         if "query_encoding" in binary_cfg:
-        #             raise ValueError(f"Asymmetric binary quantization is not supported: {qcfg}")
-        #         source_prec = Precision.BINARY2
-        #     elif "product" in qcfg:
-        #         raise ValueError(f"Product quantization is not supported: {qcfg}")
-        #     else:
-        #         source_prec = Precision.FLOAT32
-        # else:
-        #     source_prec = Precision.FLOAT32
-
-        # if self._user_precision:
-        #     user_p = _resolve_precision(self._user_precision)
-        #     _validate_precision_downgrade(user_p, source_prec)
-        #     self._resolved_precision = user_p
-        # else:
-        #     self._resolved_precision = source_prec
-
-        # logger.info(f"  Precision: {PRECISION_NAMES.get(self._resolved_precision, self._resolved_precision)}")
-
-        # Subclass validates sparse presence/absence
         self._schema = RowSchema(
             fields = schema_fields,
             dimension= self.dimension,
-            space_type= qdrant_space,
-            is_hybrid= False if self._sparse_slot is -1 else True
+            space_type= canonical_space,
+            is_hybrid= False if self._sparse_slot is -1 else True,
+            canonical_precision= canonical_precision
         )
         self._validate_schema(sparse_vectors)
         return self._schema
@@ -304,18 +280,48 @@ class QdrantBaseSource(BaseSource):
     def _validate_schema(self,  sparse_vectors):
         """Override in subclass."""
 
-    # ── Index config ──────────────────────────────────────────────────────────
 
-    # def get_index_config(self) -> IndexConfig:
-    #     return IndexConfig(
-    #         dimension    = self.dimension,
-    #         space_type   = self.space_type,
-    #         M            = self.M,
-    #         ef_construct = self.ef_construct,
-    #         precision    = self._resolved_precision,
-    #         is_hybrid    = self.sparse_field_name is not None,
-    #     )
+    def _extract_qdrant_precision_key(self, qcfg) -> str:
+        """
+        Reads Qdrant quantization_config and returns the key to look up
+        in QDRANT_TO_CANONICAL_PRECISION_MAPPING.
+        """
+        if qcfg is None:
+            return "none"                          # no quantization = float32
 
+        # Product quantization — no canonical equivalent, must fail early
+        if getattr(qcfg, "product", None) is not None:
+            raise ValueError(
+                "Product quantization is not supported. "
+                "Migrate without quantization or use scalar/binary instead."
+            )
+
+        # Scalar quantization (float32 → int8)
+        if getattr(qcfg, "scalar", None) is not None:
+            return "scalar"                        # → int8
+
+        # Binary quantization — check encoding sub-type
+        binary = getattr(qcfg, "binary", None)
+        if binary is not None:
+            if getattr(binary, "query_encoding", None) is not None:
+                raise ValueError(
+                    "Asymmetric binary quantization (query_encoding) is not supported."
+                )
+            encoding = getattr(binary, "encoding", None)
+            if encoding is not None:
+                # encoding values: "one_bit", "two_bits", "one_and_half_bits"
+                return f"binary:{str(encoding).lower()}"
+            return "binary"                        # default 1-bit
+
+        # TurboQuant (Qdrant v1.18+)
+        turbo = getattr(qcfg, "turbo", None)
+        if turbo is not None:
+            bits = getattr(turbo, "bits", None)
+            if bits is not None:
+                return f"turbo:bits{bits}"         # "turbo:bits4", "turbo:bits2" etc.
+            return "turbo"                         # default bits4
+
+        return "none"                              # unknown config → treat as float32
     # ── Record conversion ─────────────────────────────────────────────────────
 
     def _convert_records(self, points) -> Tuple[List[MigrationRow], float]:
@@ -360,45 +366,6 @@ class QdrantBaseSource(BaseSource):
                 logger.error(traceback.format_exc())
                 continue
         return rows, time.time() - t0
-
-        #         vec_data = pt.vector
-        #         if isinstance(vec_data, dict):
-        #             dense  = vec_data.get(self.dense_field_name)
-        #             sparse = vec_data.get(self.sparse_field_name) if self.sparse_field_name else None
-        #         else:
-        #             dense  = vec_data
-        #             sparse = None
-
-        #         payload = pt.payload or {}
-        #         if self.filter_fields:
-        #             filter_data = {k: v for k, v in payload.items() if k in self.filter_fields}
-        #             meta_data   = {k: v for k, v in payload.items() if k not in self.filter_fields}
-        #         else:
-        #             filter_data = {}
-        #             meta_data   = payload
-
-        #         mr = MigrationRecord(
-        #             id           = str(pt.id),
-        #             dense_vector = dense,
-        #             filter_data  = filter_data,
-        #             meta_data    = meta_data,
-        #         )
-        #         if sparse is not None:
-        #             mr.sparse_indices = list(sparse.indices)
-        #             mr.sparse_values  = list(sparse.values)
-
-        #         records.append(mr)
-        #     except Exception as e:
-        #         import traceback
-        #         logger.error(f"Error converting point {pt.id}: {e}")
-        #         logger.error(traceback.format_exc())
-        #         continue
-        # transform_time = time.time() - t0
-        # logger.info(
-        #     f"  [SOURCE→COMMON] {len(records)}/{len(points)} records converted "
-        #     f"in {transform_time:.3f}s"
-        # )
-        # return records
 
     # ── Scroll with retry ─────────────────────────────────────────────────────
 
