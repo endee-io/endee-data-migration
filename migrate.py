@@ -205,17 +205,17 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # ── Precision validation ──────────────────────────────────────────────────
-    VALID_PRECISIONS = {"float32", "float16", "int8", "int16", "binary"}
-    if args.precision is not None and args.precision not in VALID_PRECISIONS:
-        logger.error(f"Invalid --precision '{args.precision}'. Valid: {VALID_PRECISIONS}")
-        sys.exit(1)
-    if args.precision is None and args.from_db == "qdrant":
-        logger.warning(
-            "No --precision / PRECISION set for a Qdrant source. "
-            "Auto-detecting from quantization config. "
-            "Set PRECISION explicitly to suppress this warning."
-        )
+    # # ── Precision validation ──────────────────────────────────────────────────
+    # VALID_PRECISIONS = {"float32", "float16", "int8", "int16", "binary"}
+    # if args.precision is not None and args.precision not in VALID_PRECISIONS:
+    #     logger.error(f"Invalid --precision '{args.precision}'. Valid: {VALID_PRECISIONS}")
+    #     sys.exit(1)
+    # if args.precision is None and args.from_db == "qdrant":
+    #     logger.warning(
+    #         "No --precision / PRECISION set for a Qdrant source. "
+    #         "Auto-detecting from quantization config. "
+    #         "Set PRECISION explicitly to suppress this warning."
+    #     )
 
     # ── Build pipeline components ─────────────────────────────────────────────
     from core.checkpoint import MigrationCheckpoint

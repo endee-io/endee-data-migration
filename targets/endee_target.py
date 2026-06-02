@@ -103,8 +103,8 @@ class EndeeTarget(BaseTarget):
 
         # ── DEBUG: smoke-test before proceeding ──
         try:
-            indexes = self._client.list_indexes()
-            logger.info(f"  Reachable — indexes: {indexes}")
+            self._client.list_indexes()
+            logger.info(f"Endee reachable")
         except Exception as e:
             logger.error(f"  Endee unreachable after connect: {e}")
             raise

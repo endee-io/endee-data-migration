@@ -1,5 +1,5 @@
 """
-core/pipeline.py  –  Source-agnostic async producer-consumer migration pipeline.
+core/pipeline.py  -  Source-agnostic async producer-consumer migration pipeline.
 """
 from __future__ import annotations
 import asyncio, logging, signal, time
@@ -52,6 +52,11 @@ class MigrationPipeline:
                     logger.info("PRODUCER: stop requested — exiting loop")
                     break
                 self.stats["fetched"] += len(records)
+                logger.info(
+                    f"[Batch {batch_number}] FETCHED {len(records)} records | "
+                    f"fetch={src_timings.get('fetch', 0):.2f}s | "
+                    f"queue_size={queue.qsize()}/{self.max_queue_size}"
+                )
                 await queue.put({
                     "batch_number": batch_number,
                     "records":      records,
@@ -169,8 +174,7 @@ class MigrationPipeline:
         finally:
             self.source.close()
             self.target.close()
-
-        self._print_report()
+            self._print_report()
 
     def _print_report(self):
         import sys

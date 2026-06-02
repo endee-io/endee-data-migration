@@ -15,6 +15,7 @@ services:
     environment:
       - DEBUG_REMOTE=1
       - PYTHONUNBUFFERED=1
+    stop_grace_period: 60s
 
 networks:
   vector-net:

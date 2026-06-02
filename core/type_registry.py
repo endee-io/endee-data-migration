@@ -32,6 +32,8 @@ Adding a new target
 
 from __future__ import annotations
 from endee import Precision
+from typing import Any
+from pymilvus import DataType
 
 
 # CANONICAL SPACE TYPE CONSTANTS
@@ -84,6 +86,9 @@ MILVUS_PRECISION_MAPPING: dict[str, str] = {
     "float_vector":    PRECISION_FLOAT32,
     "float16_vector":  PRECISION_FLOAT16,
     "binary_vector":   PRECISION_BINARY,
+    DataType.FLOAT_VECTOR: PRECISION_FLOAT32,
+    DataType.FLOAT16_VECTOR: PRECISION_FLOAT16,
+    DataType.BINARY_VECTOR: PRECISION_BINARY,
 }
 MILVUS_TO_CANONICAL_SPACE_MAPPING = {
     "cosine": SPACE_COSINE,
@@ -184,12 +189,15 @@ def resolve_space(mapping: dict[str, str], raw: str) -> str:
         sys.exit(1)
     return result
 
-def resolve_precision(mapping: dict[str, str], raw: str) -> str:
+def resolve_precision(mapping: dict[str, str], raw: Any) -> str:
     """
     Look up a raw source dtype/precision string in the given mapping.
     Falls back to `default` and logs a warning if not found.
     """
-    normalised = ( raw or "").strip().lower()
+    if isinstance(raw, str):
+        normalised = ( raw or "").strip().lower()
+    else:
+        normalised = raw
     result = mapping.get(normalised, None)
     if result is None:
         import sys

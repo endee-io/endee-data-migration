@@ -283,6 +283,7 @@ class MilvusBaseSource(BaseSource):
             dimension  = dimension,
             space_type = space_type,
             is_hybrid  = self._sparse_field_name is not None,
+            canonical_precision = prec_name
         )
 
         # Subclass validates sparse presence/absence
