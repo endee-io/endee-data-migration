@@ -437,7 +437,7 @@ class ChromaHybridSource(ChromaBaseSource):
         """
         Encode document texts into BM25 sparse embeddings.
         Uses SparseModel.embed() — the document-side BM25 function
-        (TF × IDF + length normalisation).
+        (TF x IDF + length normalisation).
 
         Returns a list of sparse embedding objects, one per record.
         Records with no document text get a zero-length embedding.

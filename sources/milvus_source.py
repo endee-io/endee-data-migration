@@ -7,12 +7,12 @@ MilvusDenseSource  — validates dense-only collections, rejects hybrid ones.
 MilvusHybridSource — validates hybrid collections (dense+sparse), rejects dense-only.
 
 Both share a common MilvusBaseSource that handles:
-  • Connection (with protocol auto-fix)
-  • Collection loading (with timeout)
-  • Field schema detection → builds RowSchema
-  • Vector byte decoding (FLOAT16, FLOAT32, BINARY)
-  • QueryIterator-based async batch iteration (no 16384 offset cap)
-  • Checkpoint-skip on resume (count-based)
+  - Connection (with protocol auto-fix)
+  - Collection loading (with timeout)
+  - Field schema detection → builds RowSchema
+  - Vector byte decoding (FLOAT16, FLOAT32, BINARY)
+  - QueryIterator-based async batch iteration (no 16384 offset cap)
+  - Checkpoint-skip on resume (count-based)
 
 Cursor format
 ─────────────
@@ -43,7 +43,7 @@ from pymilvus import MilvusException
 
 from core.base_source import BaseSource
 from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
-from core.type_registry import MILVUS_DTYPE_TO_PRECISION, MILVUS_METRIC_TO_SPACE
+from core.type_registry import MILVUS_PRECISION_MAPPING, resolve_precision, resolve_space, MILVUS_TO_CANONICAL_SPACE_MAPPING
 
 logger = logging.getLogger(__name__)
 
@@ -168,10 +168,10 @@ class MilvusBaseSource(BaseSource):
         Builds RowSchema with field roles — source knows nothing about Endee.
 
         Slot layout:
-          0        → ID
-          1        → DENSE_VECTOR
-          2        → SPARSE_VECTOR (hybrid only)
-          last     → JSON payload (all meta fields bundled)
+          0        -> ID
+          1        -> DENSE_VECTOR
+          2        -> SPARSE_VECTOR (hybrid only)
+          last     -> JSON payload (all meta fields bundled)
         """
         self._load_collection()
 
@@ -220,7 +220,7 @@ class MilvusBaseSource(BaseSource):
                 # Read metric type from index
                 index_info = self.milvus_client.describe_index(self.collection, name) or {}
                 raw_metric = index_info.get("metric_type", "COSINE").upper()
-                space_type = MILVUS_METRIC_TO_SPACE.get(raw_metric, raw_metric.lower())
+                space_type = resolve_space(MILVUS_TO_CANONICAL_SPACE_MAPPING, raw_metric)
 
                 self._dense_field_name = name
                 self._dense_field_type = ftype
@@ -234,8 +234,7 @@ class MilvusBaseSource(BaseSource):
                 ))
 
                 prec_name = (
-                    MILVUS_DTYPE_TO_PREC_NAME.get(ftype)
-                    or MILVUS_STR_TO_PREC_NAME.get(ftype, "float32")
+                    resolve_precision(MILVUS_PRECISION_MAPPING, ftype)
                 )
                 logger.info(f"  [DENSE]  {name} [{ftype}], dim={dimension}, "
                             f"space={space_type}, precision={prec_name}")

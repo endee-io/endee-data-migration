@@ -88,10 +88,10 @@ class RowSchema:
     space_type:   str
     dimension :   int
     is_hybrid :   bool  
+    canonical_precision: str
 
     # M:            int
     # ef_construct: int
-    # precision:    Optional[Any]
     # sparse_model: Optional[str] = None  # e.g. "bm25" — for hybrid index creation
 
     #--- ROLE LOOKUPS ---------------------------------------------

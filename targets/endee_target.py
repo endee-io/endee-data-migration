@@ -35,7 +35,7 @@ from core.base_target import BaseTarget
 from core.schema import FieldRole, FieldType, MigrationRow, RowSchema
 import time
 from constants import DEFAULT_SPARSE_MODEL, ENDEE_V1_API
-from core.type_registry import resolve_space, ENDEE_SPACE_MAPPING
+from core.type_registry import resolve_space, CANONICAL_TO_ENDEE_SPACE_MAPPING, CANONICAL_TO_ENDEE_PRECISION_MAPPING, resolve_precision,  PRECISION_RANK
 
 logger = logging.getLogger(__name__)
 
@@ -67,26 +67,26 @@ class EndeeTarget(BaseTarget):
         precision:              Precision = Precision.INT16,   
 
     ):
-        self.endee_url        = endee_url
-        self.endee_api_key    = endee_api_key
-        self.index_name       = index_name
-        self.upsert_chunk_size = upsert_chunk_size
-        self.sparse_model     = sparse_model
-        self.space_type        = resolve_space(ENDEE_SPACE_MAPPING, space_type)
-        self.M                 = M
-        self.ef_construct      = ef_construct
-        self.precision         = precision
+        self.endee_url              = endee_url
+        self.endee_api_key          = endee_api_key
+        self.index_name             = index_name
+        self.upsert_chunk_size      = upsert_chunk_size
+        self.sparse_model           = sparse_model
+        self.space_type             = resolve_space(CANONICAL_TO_ENDEE_SPACE_MAPPING, space_type)
+        self.M                      = M
+        self.ef_construct           = ef_construct
+        self.precision              = precision # CANONICAL PRECISION
 
-        self._client: Any = None
-        self._index:  Any = None
+        self._client: Any           = None
+        self._index:  Any           = None
 
         self.filter_fields: Set[str] = (
             set(f.strip() for f in filter_fields.split(",") if f.strip())
             if filter_fields else set()
         )
-        self._pk_slot:     int = -1
-        self._dense_slot:  int = -1
-        self._sparse_slot: int = -1
+        self._pk_slot:     int      = -1
+        self._dense_slot:  int      = -1
+        self._sparse_slot: int      = -1
         self._payload_slots: List[int] = []
         self._payload_types: List[FieldType] = []
         self._payload_names: List[str] = []
@@ -135,6 +135,18 @@ class EndeeTarget(BaseTarget):
         dense_field  = schema.get_dense_vector()
         sparse_field = schema.get_sparse_vector()
         meta_fields  = schema.get_metadata_fields()
+        target_canonical_precision = schema.canonical_precision
+
+        # CHECK PRECISION DOWNGRADE
+        source_db_precision_rank = PRECISION_RANK.get(target_canonical_precision)
+        endee_db_precision_rank = PRECISION_RANK.get(self.precision)
+        if endee_db_precision_rank > source_db_precision_rank:
+            logger.error(f"Precision Upgrade Not Allowed: {target_canonical_precision} -> {self.precision}")
+            sys.exit(1)
+        elif endee_db_precision_rank < source_db_precision_rank:
+            logger.warning(f"Precision Downgrade Detected: {target_canonical_precision} -> {self.precision}")
+
+        self.endee_precision = resolve_precision(CANONICAL_TO_ENDEE_PRECISION_MAPPING, self.precision)
 
         self.dimension = dense_field.dimension
         # REQUIRED FIELDS
@@ -173,7 +185,7 @@ class EndeeTarget(BaseTarget):
             space_type = self.space_type,        # from RowSchema
             M          = self.M,                 # from RowSchema
             ef_con     = self.ef_construct,      # from RowSchema
-            precision  = self.precision,         # from RowSchema
+            precision  = self.endee_precision,         # from RowSchema
         )
         if schema.is_hybrid:
             kwargs["sparse_model"] = self.sparse_model
