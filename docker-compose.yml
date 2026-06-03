@@ -6,18 +6,18 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-    networks:
-      - vector-net
+    # networks:
+    #   - vector-net
     stdin_open: true
     tty: true
-    ports:
-      - "5678:5678"       # expose debugpy port
+    # ports:
+    #   - "5678:5678"       # expose debugpy port
     environment:
-      - DEBUG_REMOTE=1
+      # - DEBUG_REMOTE=1
       - PYTHONUNBUFFERED=1
     stop_grace_period: 60s
     network_mode: host
 
-networks:
-  vector-net:
-    external: true
+# networks:
+#   vector-net:
+#     external: true
