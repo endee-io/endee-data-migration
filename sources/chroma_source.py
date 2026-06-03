@@ -9,14 +9,14 @@ ChromaHybridSource — generates sparse vectors on the source side from
                      migrates dense + generated sparse to a hybrid Endee index.
 
 Both share a common ChromaBaseSource that handles:
-  • Connection (HttpClient or PersistentClient)
-  • Dimension auto-detection (peek at first record)
-  • Schema building → RowSchema
-  • Offset-based async batch iteration with retry
+  - Connection (HttpClient or PersistentClient)
+  - Dimension auto-detection (peek at first record)
+  - Schema building -> RowSchema
+  - Offset-based async batch iteration with retry
 
 Sparse generation (ChromaHybridSource only)
 ───────────────────────────────────────────
-  SparseModel("endee/bm25").embed(doc_texts)  — TF × IDF + length normalisation
+  SparseModel("endee/bm25").embed(doc_texts)  — TF x IDF + length normalisation
   Called per batch in _convert_records().
 
   Requires document text to be stored in the ChromaDB collection.
@@ -32,15 +32,15 @@ initial_cursor=0 means start from the beginning.
 RowSchema slot layout
 ──────────────────────
   Dense:
-    SLOT 0  → ID         (STRING)
-    SLOT 1  → DENSE_VECTOR
-    SLOT 2  → JSON payload (metadata)
+    SLOT 0  -> ID         (STRING)
+    SLOT 1  -> DENSE_VECTOR
+    SLOT 2  -> JSON payload (metadata)
 
   Hybrid:
-    SLOT 0  → ID         (STRING)
-    SLOT 1  → DENSE_VECTOR
-    SLOT 2  → SPARSE_VECTOR  (generated from document text)
-    SLOT 3  → JSON payload   (metadata + optionally document text)
+    SLOT 0  -> ID         (STRING)
+    SLOT 1  -> DENSE_VECTOR
+    SLOT 2  -> SPARSE_VECTOR  (generated from document text)
+    SLOT 3  -> JSON payload   (metadata + optionally document text)
 """
 
 from __future__ import annotations
