@@ -355,9 +355,9 @@ class ChromaBaseSource(BaseSource):
         pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Public connectors
-# ══════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
+# # Public connectors
+# # ══════════════════════════════════════════════════════════════════════════════
 
 class ChromaDenseSource(ChromaBaseSource):
     """
@@ -379,105 +379,105 @@ class ChromaDenseSource(ChromaBaseSource):
         )
 
 
-class ChromaHybridSource(ChromaBaseSource):
-    """
-    ChromaDB source for HYBRID migration.
+# class ChromaHybridSource(ChromaBaseSource):
+#     """
+#     ChromaDB source for HYBRID migration.
 
-    Generates sparse vectors ON THE SOURCE SIDE from stored document text
-    using endee-model SparseModel (default: "endee/bm25").
+#     Generates sparse vectors ON THE SOURCE SIDE from stored document text
+#     using endee-model SparseModel (default: "endee/bm25").
 
-    The sink creates the Endee index with sparse_model=args.sparse_model
-    (e.g. "endee_bm25") — server applies IDF at search time.
+#     The sink creates the Endee index with sparse_model=args.sparse_model
+#     (e.g. "endee_bm25") — server applies IDF at search time.
 
-    Requires: document text stored in the ChromaDB collection.
-    """
+#     Requires: document text stored in the ChromaDB collection.
+#     """
 
-    def __init__(
-        self,
-        url:                    str,
-        collection:             str,
-        api_key:                str  = "",
-        source_path:            Optional[str] = None,
-        store_document_in_meta: bool = True,
-        sparse_model_name:      str  = "endee/bm25",
-    ):
-        super().__init__(
-            url                    = url,
-            collection             = collection,
-            api_key                = api_key,
-            source_path            = source_path,
-            store_document_in_meta = store_document_in_meta,
-        )
-        self.sparse_model_name = sparse_model_name
-        self._sparse_model     = None
+#     def __init__(
+#         self,
+#         url:                    str,
+#         collection:             str,
+#         api_key:                str  = "",
+#         source_path:            Optional[str] = None,
+#         store_document_in_meta: bool = True,
+#         sparse_model_name:      str  = "endee/bm25",
+#     ):
+#         super().__init__(
+#             url                    = url,
+#             collection             = collection,
+#             api_key                = api_key,
+#             source_path            = source_path,
+#             store_document_in_meta = store_document_in_meta,
+#         )
+#         self.sparse_model_name = sparse_model_name
+#         self._sparse_model     = None
 
-    def connect(self):
-        super().connect()
-        self._load_sparse_model()
+#     def connect(self):
+#         super().connect()
+#         self._load_sparse_model()
 
-    def _load_sparse_model(self):
-        try:
-            from endee_model import SparseModel
-        except ImportError:
-            sys.exit(
-                "ERROR: endee-model is not installed.  Run: pip install endee-model"
-            )
-        logger.info(f"Loading sparse model  '{self.sparse_model_name}'...")
-        self._sparse_model = SparseModel(model_name=self.sparse_model_name)
-        logger.info(f"  Sparse model ready: {self.sparse_model_name}")
+#     def _load_sparse_model(self):
+#         try:
+#             from endee_model import SparseModel
+#         except ImportError:
+#             sys.exit(
+#                 "ERROR: endee-model is not installed.  Run: pip install endee-model"
+#             )
+#         logger.info(f"Loading sparse model  '{self.sparse_model_name}'...")
+#         self._sparse_model = SparseModel(model_name=self.sparse_model_name)
+#         logger.info(f"  Sparse model ready: {self.sparse_model_name}")
 
-    def _build_sparse_field(self) -> FieldSchema:
-        return FieldSchema(
-            name       = "sparse_vector",
-            field_type = FieldType.SPARSE_VECTOR,
-            role       = FieldRole.SPARSE_VECTOR,
-        )
+#     def _build_sparse_field(self) -> FieldSchema:
+#         return FieldSchema(
+#             name       = "sparse_vector",
+#             field_type = FieldType.SPARSE_VECTOR,
+#             role       = FieldRole.SPARSE_VECTOR,
+#         )
 
-    def _encode_sparse(self, documents: Optional[list], count: int) -> Optional[list]:
-        """
-        Encode document texts into BM25 sparse embeddings.
-        Uses SparseModel.embed() — the document-side BM25 function
-        (TF x IDF + length normalisation).
+#     def _encode_sparse(self, documents: Optional[list], count: int) -> Optional[list]:
+#         """
+#         Encode document texts into BM25 sparse embeddings.
+#         Uses SparseModel.embed() — the document-side BM25 function
+#         (TF x IDF + length normalisation).
 
-        Returns a list of sparse embedding objects, one per record.
-        Records with no document text get a zero-length embedding.
-        """
-        if not documents:
-            logger.error(
-                "No document text in this batch — cannot generate sparse vectors. "
-                "ChromaDB collection must have 'documents' stored for hybrid migration."
-            )
-            raise RuntimeError(
-                "ChromaHybridSource requires document text in the collection. "
-                "Use ChromaDenseSource for collections without documents."
-            )
+#         Returns a list of sparse embedding objects, one per record.
+#         Records with no document text get a zero-length embedding.
+#         """
+#         if not documents:
+#             logger.error(
+#                 "No document text in this batch — cannot generate sparse vectors. "
+#                 "ChromaDB collection must have 'documents' stored for hybrid migration."
+#             )
+#             raise RuntimeError(
+#                 "ChromaHybridSource requires document text in the collection. "
+#                 "Use ChromaDenseSource for collections without documents."
+#             )
 
-        doc_texts = [
-            (documents[i] or "") if i < len(documents) else ""
-            for i in range(count)
-        ]
+#         doc_texts = [
+#             (documents[i] or "") if i < len(documents) else ""
+#             for i in range(count)
+#         ]
 
-        if all(t == "" for t in doc_texts):
-            raise RuntimeError(
-                "All documents in this batch are empty — cannot generate BM25 sparse vectors. "
-                "Ensure the ChromaDB collection was created with 'documents' populated."
-            )
+#         if all(t == "" for t in doc_texts):
+#             raise RuntimeError(
+#                 "All documents in this batch are empty — cannot generate BM25 sparse vectors. "
+#                 "Ensure the ChromaDB collection was created with 'documents' populated."
+#             )
 
-        return list(self._sparse_model.embed(doc_texts))
+#         return list(self._sparse_model.embed(doc_texts))
 
-    def _validate_schema(self):
-        logger.info(
-            f"Schema validated: hybrid (ChromaDB → Endee) | "
-            f"sparse_model='{self.sparse_model_name}'"
-        )
+#     def _validate_schema(self):
+#         logger.info(
+#             f"Schema validated: hybrid (ChromaDB -> Endee) | "
+#             f"sparse_model='{self.sparse_model_name}'"
+#         )
 
-    @classmethod
-    def from_args(cls, args):
-        return cls(
-            url                    = args.source_url,
-            collection             = args.source_collection,
-            api_key                = args.source_api_key,
-            source_path            = getattr(args, "source_path", None),
-            store_document_in_meta = getattr(args, "store_document_in_meta", True),
-            sparse_model_name      = getattr(args, "sparse_model", "endee/bm25"),
-        )
+#     @classmethod
+#     def from_args(cls, args):
+#         return cls(
+#             url                    = args.source_url,
+#             collection             = args.source_collection,
+#             api_key                = args.source_api_key,
+#             source_path            = getattr(args, "source_path", None),
+#             store_document_in_meta = getattr(args, "store_document_in_meta", True),
+#             sparse_model_name      = getattr(args, "sparse_model", "endee/bm25"),
+#         )
