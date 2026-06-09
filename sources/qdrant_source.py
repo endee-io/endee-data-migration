@@ -447,7 +447,21 @@ class QdrantDenseSource(QdrantBaseSource):
     """
     Qdrant source for DENSE-ONLY collections.
     Raises ValueError if sparse vector fields are detected.
+    Optionally generates sparse vectors from a payload text field when sparse_algo is set.
     """
+
+    def __init__(self, *args, sparse_algo=None, sparse_text_field=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sparse_algo       = sparse_algo
+        self.sparse_text_field = sparse_text_field
+        self._encoder          = None
+
+    def connect(self):
+        super().connect()
+        if self.sparse_algo:
+            from sparse_encoders.factory_sparse_encoder import SparseEncoderFactory
+            self._encoder = SparseEncoderFactory.create(self.sparse_algo)
+            logger.info(f"Sparse encoder loaded: {type(self._encoder).__name__} (algo='{self.sparse_algo}')")
 
     def _validate_schema(self, sparse_vectors):
         has_sparse = bool(sparse_vectors and isinstance(sparse_vectors, dict) and sparse_vectors)
@@ -456,20 +470,103 @@ class QdrantDenseSource(QdrantBaseSource):
                 f"Collection '{self.collection}' is HYBRID. "
                 f"Use QdrantHybridSource instead."
             )
-        logger.info("Schema validated: dense-only collection")
+        if self.sparse_algo:
+            logger.info(f"Schema validated: dense collection — sparse will be generated via '{self.sparse_algo}' from field '{self.sparse_text_field}'")
+        else:
+            logger.info("Schema validated: dense-only collection")
+
+    def detect_schema(self) -> RowSchema:
+        schema = super().detect_schema()
+
+        if not self.sparse_algo:
+            return schema
+
+        # Peek at one real record to confirm the text field exists in payload
+        try:
+            results, _ = self.qdrant_client.scroll(
+                collection_name=self.collection,
+                limit=1,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to peek at collection records: {e}")
+
+        if not results or not (results[0].payload or {}).get(self.sparse_text_field):
+            raise ValueError(
+                f"Field '{self.sparse_text_field}' is empty or missing in collection '{self.collection}'.\n"
+                "Cannot generate sparse vectors without text. "
+                "Set SPARSE_TEXT_FIELD to a payload field that contains text, or remove SPARSE_ALGO to run a dense migration."
+            )
+
+        # Add sparse slot and update schema to hybrid
+        schema.fields.append(FieldSchema(
+            name       = "sparse_vector",
+            field_type = FieldType.SPARSE_VECTOR,
+            role       = FieldRole.SPARSE_VECTOR,
+        ))
+        self._sparse_slot  = len(schema.fields) - 1
+        self._payload_slot = self._sparse_slot + 1
+        schema.fields.append(FieldSchema(
+            name       = "payload",
+            field_type = FieldType.JSON,
+            role       = FieldRole.METADATA,
+        ))
+        schema.is_hybrid = True
+        logger.info(f"  [SPARSE] will be generated via '{self.sparse_algo}' from field '{self.sparse_text_field}' (slot={self._sparse_slot})")
+        return schema
+
+    def _convert_records(self, points):
+        if not self.sparse_algo:
+            return super()._convert_records(points)
+
+        t0    = time.time()
+        rows  = []
+        texts = [(pt.payload or {}).get(self.sparse_text_field) or "" for pt in points]
+
+        if all(t == "" for t in texts):
+            raise RuntimeError(
+                f"All records in this batch have empty '{self.sparse_text_field}' — cannot generate sparse vectors."
+            )
+
+        if hasattr(self._encoder, "encode_batch"):
+            sparse_embs = self._encoder.encode_batch(texts)
+        else:
+            sparse_embs = [self._encoder.encode(t) for t in texts]
+
+        for i, pt in enumerate(points):
+            try:
+                row = MigrationRow(self._schema.total_fields)
+                row.set_field(0, str(pt.id))
+
+                vec_data = pt.vector
+                dense = vec_data.get(self._dense_field_name) if isinstance(vec_data, dict) else vec_data
+                row.set_field(self._dense_slot, dense)
+
+                sp = sparse_embs[i]
+                if sp and sp.get("indices"):
+                    row.set_field(self._sparse_slot, sp)
+
+                row.set_field(self._payload_slot, pt.payload or {})
+                rows.append(row)
+            except Exception as e:
+                import traceback
+                logger.error(f"Error converting point {pt.id}: {e}")
+                logger.error(traceback.format_exc())
+                continue
+
+        return rows, time.time() - t0
+
     @classmethod
     def from_args(cls, args):
         return cls(
-            url           = args.source_url,
-            collection    = args.source_collection,
-            api_key       = args.source_api_key,
-            port          = args.source_port,
-            use_https     = args.use_https,
-            # space_type    = args.space_type if args.space_type != "cosine" else None,
-            # M             = args.M,
-            # ef_construct  = args.ef_construct,
-            # precision     = args.precision,
-            # filter_fields = args.filter_fields,
+            url               = args.source_url,
+            collection        = args.source_collection,
+            api_key           = args.source_api_key,
+            port              = args.source_port,
+            use_https         = args.use_https,
+            sparse_algo       = getattr(args, "sparse_algo", None),
+            sparse_text_field = getattr(args, "sparse_text_field", None),
         )
 
 

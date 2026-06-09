@@ -456,7 +456,21 @@ class MilvusDenseSource(MilvusBaseSource):
     """
     Milvus source for DENSE-ONLY collections.
     Raises ValueError if sparse vector fields are detected.
+    Optionally generates sparse vectors from a text payload field when sparse_algo is set.
     """
+
+    def __init__(self, *args, sparse_algo=None, sparse_text_field=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sparse_algo       = sparse_algo
+        self.sparse_text_field = sparse_text_field
+        self._encoder          = None
+
+    def connect(self):
+        super().connect()
+        if self.sparse_algo:
+            from sparse_encoders.factory_sparse_encoder import SparseEncoderFactory
+            self._encoder = SparseEncoderFactory.create(self.sparse_algo)
+            logger.info(f"Sparse encoder loaded: {type(self._encoder).__name__} (algo='{self.sparse_algo}')")
 
     def _validate_schema(self, sparse_fields: list):
         if sparse_fields:
@@ -465,16 +479,108 @@ class MilvusDenseSource(MilvusBaseSource):
                 f"(sparse fields: {sparse_fields}).\n"
                 f"Use MilvusHybridSource instead."
             )
-        logger.info("Schema validated: dense-only collection")
+        if self.sparse_algo:
+            logger.info(f"Schema validated: dense collection — sparse will be generated via '{self.sparse_algo}' from field '{self.sparse_text_field}'")
+        else:
+            logger.info("Schema validated: dense-only collection")
+
+    def detect_schema(self) -> RowSchema:
+        schema = super().detect_schema()
+
+        if not self.sparse_algo:
+            return schema
+
+        # Peek at one record to confirm the text field exists in actual data
+        try:
+            sample = self.milvus_client.query(
+                collection_name=self.collection,
+                filter="",
+                output_fields=[self.sparse_text_field],
+                limit=1,
+            )
+        except Exception as e:
+            raise ValueError(
+                f"Failed to read field '{self.sparse_text_field}' from collection '{self.collection}': {e}\n"
+                "Check that SPARSE_TEXT_FIELD matches a real field name in the collection."
+            )
+
+        if not sample or not sample[0].get(self.sparse_text_field):
+            raise ValueError(
+                f"Field '{self.sparse_text_field}' is empty or missing in collection '{self.collection}'.\n"
+                "Cannot generate sparse vectors without text. "
+                "Set SPARSE_TEXT_FIELD to a field that contains text, or remove SPARSE_ALGO to run a dense migration."
+            )
+
+        # Add sparse slot to schema so target creates a hybrid index
+        from core.schema import FieldSchema, FieldType, FieldRole
+        schema.fields.append(FieldSchema(
+            name       = "sparse_vector",
+            field_type = FieldType.SPARSE_VECTOR,
+            role       = FieldRole.SPARSE_VECTOR,
+        ))
+        self._sparse_slot = len(schema.fields) - 1
+        # Move payload slot one position forward
+        self._payload_slot = self._sparse_slot + 1
+        schema.fields.append(FieldSchema(
+            name       = "payload",
+            field_type = FieldType.JSON,
+            role       = FieldRole.METADATA,
+        ))
+        schema.is_hybrid = True
+        logger.info(f"  [SPARSE] will be generated via '{self.sparse_algo}' from field '{self.sparse_text_field}' (slot={self._sparse_slot})")
+        return schema
+
+    def _convert_records(self, milvus_records: list):
+        if not self.sparse_algo:
+            return super()._convert_records(milvus_records)
+
+        t0   = time.time()
+        rows = []
+
+        texts = [
+            (rec.get(self.sparse_text_field) or "") for rec in milvus_records
+        ]
+        if all(t == "" for t in texts):
+            raise RuntimeError(
+                f"All records in this batch have empty '{self.sparse_text_field}' — cannot generate sparse vectors."
+            )
+
+        if hasattr(self._encoder, "encode_batch"):
+            sparse_embs = self._encoder.encode_batch(texts)
+        else:
+            sparse_embs = [self._encoder.encode(t) for t in texts]
+
+        for i, rec in enumerate(milvus_records):
+            try:
+                row = MigrationRow(self._schema.total_fields)
+                row.set_field(0, str(rec.get(self._schema.fields[0].name, "")))
+                raw   = rec.get(self._dense_field_name, [])
+                dense = self._decode_vector(raw, self._dense_field_type)
+                row.set_field(self._dense_slot, dense)
+                sp = sparse_embs[i]
+                if sp and sp.get("indices"):
+                    row.set_field(self._sparse_slot, sp)
+                payload = {k: rec.get(k) for k in self._meta_field_names if k in rec}
+                row.set_field(self._payload_slot, payload)
+                rows.append(row)
+            except Exception as e:
+                import traceback
+                logger.error(f"Error converting record: {e}")
+                logger.error(traceback.format_exc())
+                continue
+
+        return rows, time.time() - t0
 
     @classmethod
     def from_args(cls, args):
         return cls(
-            url        = args.source_url,
-            token      = args.source_api_key,
-            collection = args.source_collection,
-            db         = args.source_db,
-            port       = args.source_port or 19530,
+            url              = args.source_url,
+            token            = args.source_api_key,
+            collection       = args.source_collection,
+            db               = args.source_db,
+            port             = args.source_port or 19530,
+            sparse_algo      = getattr(args, "sparse_algo", None),
+            sparse_text_field= getattr(args, "sparse_text_field", None),
         )
 
 
