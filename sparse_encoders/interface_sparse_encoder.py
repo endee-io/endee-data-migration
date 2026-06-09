@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from core.type_registry import FieldSchema
+from core.schema import FieldSchema
 
 class BaseSparseEncoder(ABC):
     @abstractmethod

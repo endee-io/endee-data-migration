@@ -1,7 +1,7 @@
 # sparse_encoders/endee_bm25.py
 from endee_model import SparseModel
 from sparse_encoders.interface_sparse_encoder import BaseSparseEncoder
-from core.type_registry import FieldSchema, FieldType, FieldRole
+from core.schema import FieldSchema, FieldType, FieldRole
 
 
 class EndeeBM25(BaseSparseEncoder):
