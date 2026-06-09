@@ -42,4 +42,4 @@ class SparseEncoderFactory:
 # Import here (not at top) to avoid circular imports and defer heavy deps
 from sparse_encoders.concrete_sparse_encoders import EndeeBM25        # noqa: E402
 
-SparseEncoderFactory.register("bm25",   EndeeBM25)
+SparseEncoderFactory.register("endee/bm25",   EndeeBM25)

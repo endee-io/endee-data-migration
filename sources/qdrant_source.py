@@ -271,7 +271,7 @@ class QdrantBaseSource(BaseSource):
             fields = schema_fields,
             dimension= self.dimension,
             space_type= canonical_space,
-            is_hybrid= False if self._sparse_slot is -1 else True,
+            is_hybrid= False if self._sparse_slot == -1 else True,
             canonical_precision= canonical_precision
         )
         self._validate_schema(sparse_vectors)

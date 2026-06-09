@@ -20,9 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # RUN pip install --no-cache-dir -r requirements.txt endee-0.1.19-py3-none-any.whl
 
 # Copy migration scripts and modules
-COPY sources/     /app/sources/
-COPY targets/       /app/targets/
-COPY core/        /app/core/
+COPY sources/         /app/sources/
+COPY targets/         /app/targets/
+COPY core/            /app/core/
+COPY sparse_encoders/ /app/sparse_encoders/
 COPY constants.py /app/constants.py
 COPY migrate.py /app/migrate.py
 COPY entrypoint.sh /app/entrypoint.sh

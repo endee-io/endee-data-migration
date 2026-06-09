@@ -4,17 +4,18 @@ migrate.py  -  Unified CLI entrypoint for all migration types.
 
 Usage
 ─────
-    python migrate.py --from milvus --to endee --type dense [OPTIONS]
-    python migrate.py --from qdrant --to endee --type hybrid [OPTIONS]
+    python migrate.py --from milvus --to endee --source_type dense --target_type dense [OPTIONS]
+    python migrate.py --from chroma --to endee --source_type dense --target_type hybrid [OPTIONS]
 
 How the registry works
 ──────────────────────
-    SOURCE_REGISTRY[(from_db, vector_type)]  -  SourceClass
-    Target_REGISTRY  [(to_db,   vector_type)]  -  TargetClass
+    SOURCE_REGISTRY[(from_db, source_type)]  -  SourceClass
+    TARGET_REGISTRY[(to_db,   target_type)]  -  TargetClass
 
-    Both factories are single dict lookups — no if/elif chains.
-    Each class owns its own from_args() classmethod, so this file
-    never needs to know which args a specific DB requires.
+    source_type describes what is IN the source collection.
+    target_type describes what index to CREATE on the target.
+    They are independent — e.g. chroma dense source → endee hybrid target
+    (sparse generated on the fly by the source connector).
 
 Adding a new migration type
 ───────────────────────────
@@ -23,7 +24,7 @@ Adding a new migration type
     2. Write a BaseSink subclass if needed (e.g. sinks/weaviate_sink.py).
        Implement from_args(args) to pull whatever args your sink needs.
     3. Add --from / --to argument values to the choices= lists below.
-    4. Add one entry to SOURCE_REGISTRY and/or SINK_REGISTRY.
+    4. Add one entry to SOURCE_REGISTRY and/or TARGET_REGISTRY.
     Nothing else changes.
 """
 
@@ -43,35 +44,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# import debugpy
-# if os.getenv('DEBUG_REMOTE') == '1':
-#     debugpy.listen(("0.0.0.0", 5678))
-#     print("Waiting for debugger to attach on port 5678...")
-#     debugpy.wait_for_client()  # Script pauses here until you attach
-#     print("Debugger attached!")
-
-# ── Registries ────────────────────────────────────────────────────────────────
-# Key: (database_name, vector_type)
-# Value: connector class (must implement from_args(args))
-#
-# To add Pinecone as a source:
-#   from sources.pinecone_source import PineconeDenseSource
-#   SOURCE_REGISTRY[("pinecone", "dense")] = PineconeDenseSource
-#
-# To add Weaviate as a sink:
-#   from sinks.weaviate_sink import WeaviateSink
-#   SINK_REGISTRY[("weaviate", "dense")]  = WeaviateSink
-#   SINK_REGISTRY[("weaviate", "hybrid")] = WeaviateSink
 
 from sources.milvus_source import MilvusDenseSource, MilvusHybridSource
 from sources.qdrant_source import QdrantDenseSource, QdrantHybridSource
 from targets.endee_target import EndeeTarget
+from sources.chroma_source import ChromaDenseSource
 
 SOURCE_REGISTRY = {
     ("milvus", "dense"):  MilvusDenseSource,
     ("milvus", "hybrid"): MilvusHybridSource,
     ("qdrant", "dense"):  QdrantDenseSource,
     ("qdrant", "hybrid"): QdrantHybridSource,
+    ("chroma", "dense"):  ChromaDenseSource,
 }
 
 TARGET_REGISTRY = {
@@ -92,24 +76,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--from", dest="from_db",
         default=os.getenv("FROM_DB"),
-        choices=["milvus", "qdrant"],       # extend when adding new sources
+        choices=["milvus", "qdrant", "chroma"],
         required=not os.getenv("FROM_DB"),
         metavar="DB",
-        help="Source database type.  Choices: milvus | qdrant",
+        help="Source database type.  Choices: milvus | qdrant | chroma",
     )
     p.add_argument(
         "--to", dest="to_db",
         default=os.getenv("TO_DB"),
-        choices=["endee"],                  # extend when adding new Target
+        choices=["endee"],
         required=not os.getenv("TO_DB"),
         metavar="DB",
         help="Target database type.  Choices: endee",
     )
     p.add_argument(
-        "--type",
-        default=os.getenv("VECTOR_TYPE", "dense"),
+        "--source_type",
+        default=os.getenv("SOURCE_TYPE", "dense"),
         choices=["dense", "hybrid"],
-        help="Vector type of the collection (default: dense)",
+        help="Vector type of the SOURCE collection (default: dense)",
+    )
+    p.add_argument(
+        "--target_type",
+        default=os.getenv("TARGET_TYPE", "dense"),
+        choices=["dense", "hybrid"],
+        help="Vector type of the TARGET index to create (default: dense)",
     )
 
     # ── Source ────────────────────────────────────────────────────────────────
@@ -167,17 +157,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug", action="store_true",
                    default=os.getenv("DEBUG", "false").lower() == "true")
 
+    sparse = p.add_argument_group("Sparse encoding (target_type=hybrid only)")
+    sparse.add_argument(
+        "--sparse_algo",
+        default=os.getenv("SPARSE_ALGO", None),
+        choices=["endee/bm25"],
+        help="Local encoder for generating sparse vectors from document text (e.g. endee/bm25). Required when source has no stored sparse vectors.",
+    )
+    sparse.add_argument(
+        "--sparse_model",
+        default=os.getenv("SPARSE_MODEL", None),
+        choices=["endee_bm25", "default"],
+        help="Sparse model name sent to Endee API when creating a hybrid index.",
+    )
+
     return p
 
 
 # ── Factories — no if/elif; pure registry lookups ─────────────────────────────
 
 def _build_source(args):
-    key = (args.from_db, args.type)
+    key = (args.from_db, args.source_type)
     SourceClass = SOURCE_REGISTRY.get(key)
     if SourceClass is None:
         logger.error(
-            f"No source registered for --from={args.from_db} --type={args.type}.\n"
+            f"No source registered for --from={args.from_db} --source_type={args.source_type}.\n"
             f"Registered sources: {list(SOURCE_REGISTRY.keys())}"
         )
         sys.exit(1)
@@ -185,12 +189,12 @@ def _build_source(args):
 
 
 def _build_target(args):
-    key = (args.to_db, args.type)
+    key = (args.to_db, args.target_type)
     TargetClass = TARGET_REGISTRY.get(key)
     if TargetClass is None:
         logger.error(
-            f"No Target registered for --to={args.to_db} --type={args.type}.\n"
-            f"Registered Targets: {list(TARGET_REGISTRY.keys())}"
+            f"No target registered for --to={args.to_db} --target_type={args.target_type}.\n"
+            f"Registered targets: {list(TARGET_REGISTRY.keys())}"
         )
         sys.exit(1)
     return TargetClass.from_args(args)
@@ -205,17 +209,29 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # # ── Precision validation ──────────────────────────────────────────────────
-    # VALID_PRECISIONS = {"float32", "float16", "int8", "int16", "binary"}
-    # if args.precision is not None and args.precision not in VALID_PRECISIONS:
-    #     logger.error(f"Invalid --precision '{args.precision}'. Valid: {VALID_PRECISIONS}")
-    #     sys.exit(1)
-    # if args.precision is None and args.from_db == "qdrant":
-    #     logger.warning(
-    #         "No --precision / PRECISION set for a Qdrant source. "
-    #         "Auto-detecting from quantization config. "
-    #         "Set PRECISION explicitly to suppress this warning."
-    #     )
+    if args.sparse_algo and args.target_type == "dense":
+        logger.error(
+            f"SPARSE_ALGO='{args.sparse_algo}' is set but TARGET_TYPE is 'dense'. "
+            "Sparse generation only makes sense when targeting a hybrid index. "
+            "Either remove SPARSE_ALGO or set TARGET_TYPE=hybrid."
+        )
+        sys.exit(1)
+
+    if args.source_type == "dense" and args.target_type == "hybrid" and not args.sparse_algo:
+        logger.error(
+            "SOURCE_TYPE=dense and TARGET_TYPE=hybrid requires SPARSE_ALGO to be set. "
+            "The source has no stored sparse vectors, so a local encoder is needed to generate them. "
+            "Set SPARSE_ALGO=endee/bm25 in your .env."
+        )
+        sys.exit(1)
+
+    if args.source_type == "hybrid" and args.target_type == "dense":
+        logger.error(
+            "Cannot migrate HYBRID source to DENSE target. "
+            "The source has sparse vectors but the target index does not support them. "
+            "Set TARGET_TYPE=hybrid to preserve sparse vectors."
+        )
+        sys.exit(1)
 
     # ── Build pipeline components ─────────────────────────────────────────────
     from core.checkpoint import MigrationCheckpoint
@@ -227,7 +243,7 @@ def main():
         checkpoint.clear()
 
     source   = _build_source(args)
-    target     = _build_target(args)
+    target   = _build_target(args)
     pipeline = MigrationPipeline(
         source           = source,
         target           = target,
@@ -238,9 +254,10 @@ def main():
 
     # ── Run ───────────────────────────────────────────────────────────────────
     logger.info("=" * 80)
-    logger.info(f"From     : {args.from_db}  ({args.source_collection} @ {args.source_url})")
-    logger.info(f"To       : {args.to_db}    ({args.target_collection})")
-    logger.info(f"Type     : {args.type}")
+    logger.info(f"From        : {args.from_db}  ({args.source_collection} @ {args.source_url})")
+    logger.info(f"To          : {args.to_db}    ({args.target_collection})")
+    logger.info(f"Source type : {args.source_type}")
+    logger.info(f"Target type : {args.target_type}")
     logger.info("=" * 80)
 
     try:

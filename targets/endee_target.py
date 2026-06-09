@@ -57,14 +57,15 @@ class EndeeTarget(BaseTarget):
         self,
         endee_url:              str,
         endee_api_key:          str,
-        index_name:             str,    
+        index_name:             str,
         upsert_chunk_size:      int = 100,
         sparse_model:           str = DEFAULT_SPARSE_MODEL,
         filter_fields:          Optional[str] = "", # FROM USER
-        space_type:             str = "cosine",    
-        M:                      int = 16,          
-        ef_construct:           int = 128,         
-        precision:              Precision = Precision.INT16,   
+        space_type:             str = "cosine",
+        M:                      int = 16,
+        ef_construct:           int = 128,
+        precision:              Precision = Precision.INT16,
+        target_type:            str = "dense",
 
     ):
         self.endee_url              = endee_url
@@ -76,6 +77,7 @@ class EndeeTarget(BaseTarget):
         self.M                      = M
         self.ef_construct           = ef_construct
         self.precision              = precision # CANONICAL PRECISION
+        self.target_type            = target_type
 
         self._client: Any           = None
         self._index:  Any           = None
@@ -187,8 +189,11 @@ class EndeeTarget(BaseTarget):
             ef_con     = self.ef_construct,      # from RowSchema
             precision  = self.endee_precision,         # from RowSchema
         )
-        if schema.is_hybrid:
-            kwargs["sparse_model"] = self.sparse_model
+        if self.target_type == "hybrid":
+            if self.sparse_model:
+                kwargs["sparse_model"] = self.sparse_model
+            else:
+                kwargs["sparse_model"] = DEFAULT_SPARSE_MODEL
             logger.info(f"Creating HYBRID index '{self.index_name}'")
         else:
             logger.info(f"Creating DENSE index '{self.index_name}'")
@@ -339,7 +344,8 @@ class EndeeTarget(BaseTarget):
             ef_construct      = args.ef_construct,
             precision         = args.precision,
             filter_fields     = args.filter_fields,
-            sparse_model      = getattr(args, "sparse_model", DEFAULT_SPARSE_MODEL)
+            sparse_model      = getattr(args, "sparse_model", DEFAULT_SPARSE_MODEL),
+            target_type       = getattr(args, "target_type", "dense"),
         )
 
     def close(self):
