@@ -170,6 +170,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["endee_bm25", "default"],
         help="Sparse model name sent to Endee API when creating a hybrid index.",
     )
+    sparse.add_argument(
+        "--sparse_text_field",
+        default=os.getenv("SPARSE_TEXT_FIELD", None),
+        help="Payload field name containing text to encode into sparse vectors. Required for qdrant/milvus when SPARSE_ALGO is set. Not needed for chroma (uses documents natively).",
+    )
 
     return p
 
@@ -230,6 +235,14 @@ def main():
             "Cannot migrate HYBRID source to DENSE target. "
             "The source has sparse vectors but the target index does not support them. "
             "Set TARGET_TYPE=hybrid to preserve sparse vectors."
+        )
+        sys.exit(1)
+
+    if args.sparse_algo and args.from_db in ("qdrant", "milvus") and not args.sparse_text_field:
+        logger.error(
+            f"FROM_DB='{args.from_db}' with SPARSE_ALGO set requires SPARSE_TEXT_FIELD. "
+            "Specify which payload field contains the text to encode "
+            "(e.g. SPARSE_TEXT_FIELD=text)."
         )
         sys.exit(1)
 
