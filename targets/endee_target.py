@@ -29,13 +29,35 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from endee import Endee
 from endee.exceptions import NotFoundException
-from endee import Precision
 
 from core.base_target import BaseTarget
 from core.schema import FieldRole, FieldType, MigrationRow, RowSchema
 import time
 from constants import DEFAULT_SPARSE_MODEL, ENDEE_V1_API
-from core.type_registry import resolve_space, CANONICAL_TO_ENDEE_SPACE_MAPPING, CANONICAL_TO_ENDEE_PRECISION_MAPPING, resolve_precision,  PRECISION_RANK
+from endee import Precision
+from core.type_registry import (
+    SPACE_COSINE, SPACE_L2, SPACE_IP,
+    PRECISION_FLOAT32,
+    PRECISION_FLOAT16, PRECISION_INT16, PRECISION_INT8, PRECISION_BINARY,
+    resolve_space, resolve_precision,
+)
+
+# ── Canonical space → Endee space ────────────────────────────────────────────
+CANONICAL_TO_ENDEE_SPACE: dict[str, str] = {
+    SPACE_COSINE: "cosine",
+    SPACE_L2:     "l2",
+    SPACE_IP:     "ip",
+}
+
+# ── Canonical precision → Endee Precision enum ───────────────────────────────
+CANONICAL_TO_ENDEE_PRECISION: dict[str, Precision] = {
+    PRECISION_FLOAT32: Precision.FLOAT32,
+    PRECISION_FLOAT16: Precision.FLOAT16,
+    PRECISION_INT16:   Precision.INT16,
+    PRECISION_INT8:    Precision.INT8,
+    PRECISION_BINARY:  Precision.BINARY2,
+}
+
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +86,7 @@ class EndeeTarget(BaseTarget):
         space_type:             str = "cosine",
         M:                      int = 16,
         ef_construct:           int = 128,
-        precision:              Precision = Precision.INT16,
+        precision:              Optional[str] = None,
         target_type:            str = "dense",
 
     ):
@@ -73,7 +95,7 @@ class EndeeTarget(BaseTarget):
         self.index_name             = index_name
         self.upsert_chunk_size      = upsert_chunk_size
         self.sparse_model           = sparse_model
-        self.space_type             = resolve_space(CANONICAL_TO_ENDEE_SPACE_MAPPING, space_type)
+        self.space_type             = resolve_space(CANONICAL_TO_ENDEE_SPACE, space_type)
         self.M                      = M
         self.ef_construct           = ef_construct
         self.precision              = precision # CANONICAL PRECISION
@@ -137,18 +159,24 @@ class EndeeTarget(BaseTarget):
         dense_field  = schema.get_dense_vector()
         sparse_field = schema.get_sparse_vector()
         meta_fields  = schema.get_metadata_fields()
-        target_canonical_precision = schema.canonical_precision
+        source_precision = schema.canonical_precision
 
-        # CHECK PRECISION DOWNGRADE
-        source_db_precision_rank = PRECISION_RANK.get(target_canonical_precision)
-        endee_db_precision_rank = PRECISION_RANK.get(self.precision)
-        if endee_db_precision_rank > source_db_precision_rank:
-            logger.error(f"Precision Upgrade Not Allowed: {target_canonical_precision} -> {self.precision}")
+        # PRECISION COMPATIBILITY CHECK
+        # Endee only accepts float32 vectors on upsert (it quantises internally).
+        # The Milvus source sets wire precision to float32 only for FLOAT_VECTOR;
+        # all other Milvus vector types (float16, bfloat16, int8, binary) are
+        # returned as raw bytes and mapped to raw_binary — those cannot be sent to Endee.
+        if source_precision != PRECISION_FLOAT32:
+            logger.error(
+                f"Migration aborted: source collection uses a quantized vector type "
+                f"(wire precision='{source_precision}'). "
+                f"Quantized vectors (float16, bfloat16, int8, binary) cannot be migrated "
+                f"because the original float32 values are lost after quantization. "
+                f"Re-embed your data as FLOAT_VECTOR in Milvus and retry."
+            )
             sys.exit(1)
-        elif endee_db_precision_rank < source_db_precision_rank:
-            logger.warning(f"Precision Downgrade Detected: {target_canonical_precision} -> {self.precision}")
 
-        self.endee_precision = resolve_precision(CANONICAL_TO_ENDEE_PRECISION_MAPPING, self.precision)
+        self.endee_precision = resolve_precision(CANONICAL_TO_ENDEE_PRECISION, self.precision)
 
         self.dimension = dense_field.dimension
         # REQUIRED FIELDS

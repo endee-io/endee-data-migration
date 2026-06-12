@@ -33,7 +33,38 @@ from qdrant_client.http.models import Distance
 
 from core.base_source import BaseSource
 from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
-from core.type_registry import QDRANT_TO_CANONICAL_PRECISION_MAPPING, QDRANT_TO_CANONICAL_SPACE_TYPE, resolve_precision, resolve_space
+from core.type_registry import (
+    SPACE_COSINE, SPACE_L2, SPACE_IP,
+    PRECISION_FLOAT32, PRECISION_FLOAT16,
+    resolve_space,
+)
+
+# ── Qdrant → wire precision ───────────────────────────────────────────────────
+# Qdrant ALWAYS returns float32 on scroll/query regardless of vector datatype
+# or quantization method — originals are never discarded; server decompresses.
+# If Qdrant adds a new quantization type, add it here with its wire return type FIRST.
+QDRANT_TO_WIRE_PRECISION: dict[str, str] = {
+    # vector datatypes (all scroll as float32)
+    "float32": PRECISION_FLOAT32,
+    "float16": PRECISION_FLOAT32,   # stored float16, scroll returns float32
+    "uint8":   PRECISION_FLOAT32,   # stored uint8,   scroll returns float32
+    # quantization configs (all decompress to float32 on scroll)
+    "none":    PRECISION_FLOAT32,   # no quantization
+    "scalar":  PRECISION_FLOAT32,   # scalar int8     → decompressed to float32
+    "binary":  PRECISION_FLOAT32,   # binary 1-bit    → decompressed to float32
+    "turbo":   PRECISION_FLOAT32,   # turbo quant     → decompressed to float32
+    "product": PRECISION_FLOAT32,   # product quant   → decompressed to float32
+}
+
+# ── Qdrant distance → canonical space ────────────────────────────────────────
+QDRANT_TO_CANONICAL_SPACE: dict[str, str] = {
+    "cosine":    SPACE_COSINE,
+    "euclid":    SPACE_L2,
+    "dot":       SPACE_IP,
+    "manhattan": SPACE_L2,
+}
+
+
 logger = logging.getLogger(__name__)
 
 # ── Space-type mapping ────────────────────────────────────────────────────────
@@ -231,17 +262,25 @@ class QdrantBaseSource(BaseSource):
         # ── Resolve space type ────────────────────────────────────────────────
         # qdrant_space is a Distance enum — .value gives "Cosine", "Euclid" etc.
         canonical_space = resolve_space(
-            QDRANT_TO_CANONICAL_SPACE_TYPE,
-            qdrant_space.value   # "Cosine" → normalised to "cosine" inside resolve_space
+            QDRANT_TO_CANONICAL_SPACE,
+            qdrant_space.value,
         )
 
-        # ── Resolve precision from quantization_config ────────────────────────
-        qcfg = info.config.quantization_config
-        precision_key = self._extract_qdrant_precision_key(qcfg)
-        canonical_precision = resolve_precision(
-            QDRANT_TO_CANONICAL_PRECISION_MAPPING,
-            precision_key
-        )
+        # ── Resolve wire precision from quantization_config ───────────────────
+        # Qdrant always returns float32 on scroll regardless of quantization or
+        # datatype — the server decompresses originals before returning them.
+        # We look up the quantization key in QDRANT_TO_WIRE_PRECISION to be
+        # explicit about this, defaulting to float32 for any unknown config.
+        qcfg          = info.config.quantization_config
+        quant_key = self._extract_qdrant_quant_key(qcfg)
+        canonical_precision = QDRANT_TO_WIRE_PRECISION.get(quant_key)
+        if canonical_precision is None:
+            raise ValueError(
+                f"Unknown Qdrant quantization type '{quant_key}'. "
+                f"Add it and its wire return type to QDRANT_TO_WIRE_PRECISION "
+                f"in core/type_registry.py before running migration."
+            )
+        logger.info(f"  [PRECISION] quant={quant_key!r} → wire type={canonical_precision}")
 
         logger.info(f"  [DENSE]  field='{self._dense_field_name}', dim={self.dimension}, space={qdrant_space}")
 
@@ -281,47 +320,28 @@ class QdrantBaseSource(BaseSource):
         """Override in subclass."""
 
 
-    def _extract_qdrant_precision_key(self, qcfg) -> str:
+    def _extract_qdrant_quant_key(self, qcfg) -> str:
         """
-        Reads Qdrant quantization_config and returns the key to look up
-        in QDRANT_TO_CANONICAL_PRECISION_MAPPING.
+        Reads quantization_config and returns a key for QDRANT_TO_WIRE_PRECISION.
+        All keys map to float32 — Qdrant always decompresses originals on scroll.
         """
         if qcfg is None:
-            return "none"                          # no quantization = float32
+            return "none"
 
-        # Product quantization — no canonical equivalent, must fail early
         if getattr(qcfg, "product", None) is not None:
-            raise ValueError(
-                "Product quantization is not supported. "
-                "Migrate without quantization or use scalar/binary instead."
-            )
+            logger.info("  [QUANT] product quantization detected — scroll returns float32")
+            return "product"
 
-        # Scalar quantization (float32 → int8)
         if getattr(qcfg, "scalar", None) is not None:
-            return "scalar"                        # → int8
+            return "scalar"
 
-        # Binary quantization — check encoding sub-type
-        binary = getattr(qcfg, "binary", None)
-        if binary is not None:
-            if getattr(binary, "query_encoding", None) is not None:
-                raise ValueError(
-                    "Asymmetric binary quantization (query_encoding) is not supported."
-                )
-            encoding = getattr(binary, "encoding", None)
-            if encoding is not None:
-                # encoding values: "one_bit", "two_bits", "one_and_half_bits"
-                return f"binary:{str(encoding).lower()}"
-            return "binary"                        # default 1-bit
+        if getattr(qcfg, "binary", None) is not None:
+            return "binary"
 
-        # TurboQuant (Qdrant v1.18+)
-        turbo = getattr(qcfg, "turbo", None)
-        if turbo is not None:
-            bits = getattr(turbo, "bits", None)
-            if bits is not None:
-                return f"turbo:bits{bits}"         # "turbo:bits4", "turbo:bits2" etc.
-            return "turbo"                         # default bits4
+        if getattr(qcfg, "turbo", None) is not None:
+            return "turbo"
 
-        return "none"                              # unknown config → treat as float32
+        return "none"
     # ── Record conversion ─────────────────────────────────────────────────────
 
     def _convert_records(self, points) -> Tuple[List[MigrationRow], float]:
