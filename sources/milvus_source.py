@@ -37,13 +37,42 @@ import sys
 import time
 from typing import Any, List, Optional, Tuple
 
-import numpy as np
 from pymilvus import DataType, MilvusClient
 from pymilvus import MilvusException
 
 from core.base_source import BaseSource
 from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
-from core.type_registry import MILVUS_PRECISION_MAPPING, resolve_precision, resolve_space, MILVUS_TO_CANONICAL_SPACE_MAPPING
+from core.type_registry import (
+    SPACE_COSINE, SPACE_L2, SPACE_IP,
+    PRECISION_FLOAT32, PRECISION_RAW_BINARY,
+    resolve_space,
+)
+
+# ── Milvus → wire precision ───────────────────────────────────────────────────
+# FLOAT_VECTOR: client returns List[float] natively — wire precision = float32.
+# All other vector types: client returns raw bytes — wire precision = raw_binary.
+# The target (Endee) checks this value and exits if it is not float32.
+MILVUS_TO_WIRE_PRECISION: dict = {
+    DataType.FLOAT_VECTOR:    PRECISION_FLOAT32,
+    "float_vector":           PRECISION_FLOAT32,
+    DataType.FLOAT16_VECTOR:  PRECISION_RAW_BINARY,
+    "float16_vector":         PRECISION_RAW_BINARY,
+    DataType.BFLOAT16_VECTOR: PRECISION_RAW_BINARY,
+    "bfloat16_vector":        PRECISION_RAW_BINARY,
+    DataType.BINARY_VECTOR:   PRECISION_RAW_BINARY,
+    "binary_vector":          PRECISION_RAW_BINARY,
+    DataType.INT8_VECTOR:     PRECISION_RAW_BINARY,
+    "int8_vector":            PRECISION_RAW_BINARY,
+}
+
+# ── Milvus metric → canonical space ──────────────────────────────────────────
+MILVUS_TO_CANONICAL_SPACE: dict[str, str] = {
+    "cosine": SPACE_COSINE,
+    "l2":     SPACE_L2,
+    "ip":     SPACE_IP,
+}
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +136,6 @@ class MilvusBaseSource(BaseSource):
         # field names — needed for vector extraction per record
         self._dense_field_name:  Optional[str] = None
         self._sparse_field_name: Optional[str] = None
-        self._dense_field_type               = None   # DataType, for _decode_vector
         self._meta_field_names:  List[str]   = []     # all non-vector, non-pk fields
 
     # ── connect ───────────────────────────────────────────────────────────────
@@ -198,17 +226,17 @@ class MilvusBaseSource(BaseSource):
                 ))
                 logger.info(f"  [PK]     {name} [{ftype}]")
 
-            # ── BFLOAT16 — not supported ────────────────────────────────────
-            elif ftype in (DataType.BFLOAT16_VECTOR, "BFLOAT16_VECTOR"):
-                raise ValueError(
-                    f"BFLOAT16_VECTOR not supported in field '{name}'. "
-                    "Convert to FLOAT32 or FLOAT16 before migrating."
-                )
-
             # ── SLOT 1: DENSE VECTOR ────────────────────────────────────────
-            elif ftype in (DataType.FLOAT_VECTOR, DataType.FLOAT16_VECTOR,
-                           DataType.BINARY_VECTOR,
-                           "FLOAT_VECTOR", "FLOAT16_VECTOR", "BINARY_VECTOR"):
+            # All known vector types are accepted here; the target (Endee) will
+            # reject non-float32 wire precision with a clean error at setup time.
+            elif ftype in (
+                DataType.FLOAT_VECTOR,    DataType.FLOAT16_VECTOR,
+                DataType.BFLOAT16_VECTOR, DataType.BINARY_VECTOR,
+                DataType.INT8_VECTOR,
+                "FLOAT_VECTOR",    "FLOAT16_VECTOR",
+                "BFLOAT16_VECTOR", "BINARY_VECTOR",
+                "INT8_VECTOR",
+            ):
 
                 if self._dense_field_name is not None:
                     # Already have a dense field — skip extras
@@ -220,10 +248,9 @@ class MilvusBaseSource(BaseSource):
                 # Read metric type from index
                 index_info = self.milvus_client.describe_index(self.collection, name) or {}
                 raw_metric = index_info.get("metric_type", "COSINE").upper()
-                space_type = resolve_space(MILVUS_TO_CANONICAL_SPACE_MAPPING, raw_metric)
+                space_type = resolve_space(MILVUS_TO_CANONICAL_SPACE, raw_metric)
 
                 self._dense_field_name = name
-                self._dense_field_type = ftype
                 self._dense_slot       = 1   # always slot 1
 
                 schema_fields.append(FieldSchema(
@@ -233,11 +260,14 @@ class MilvusBaseSource(BaseSource):
                     dimension  = dimension,
                 ))
 
-                prec_name = (
-                    resolve_precision(MILVUS_PRECISION_MAPPING, ftype)
-                )
+                wire_precision = MILVUS_TO_WIRE_PRECISION.get(ftype)
+                if wire_precision is None:
+                    raise ValueError(
+                        f"Unknown Milvus vector field type '{ftype}' in field '{name}'. "
+                        f"Add it to MILVUS_TO_WIRE_PRECISION in milvus_source.py first."
+                    )
                 logger.info(f"  [DENSE]  {name} [{ftype}], dim={dimension}, "
-                            f"space={space_type}, precision={prec_name}")
+                            f"space={space_type}, wire_precision={wire_precision}")
 
             # ── SLOT 2 (hybrid): SPARSE VECTOR ─────────────────────────────
             elif ftype in (DataType.SPARSE_FLOAT_VECTOR, "SPARSE_FLOAT_VECTOR"):
@@ -279,11 +309,11 @@ class MilvusBaseSource(BaseSource):
         logger.info(f"  meta fields bundled into payload: {meta_field_names}")
 
         self._schema = RowSchema(
-            fields     = schema_fields,
-            dimension  = dimension,
-            space_type = space_type,
-            is_hybrid  = self._sparse_field_name is not None,
-            canonical_precision = prec_name
+            fields              = schema_fields,
+            dimension           = dimension,
+            space_type          = space_type,
+            is_hybrid           = self._sparse_field_name is not None,
+            canonical_precision = wire_precision,
         )
 
         # Subclass validates sparse presence/absence
@@ -292,25 +322,6 @@ class MilvusBaseSource(BaseSource):
 
     def _validate_schema(self, sparse_fields: list):
         """Override in subclass."""
-
-    # ── Vector decoding ───────────────────────────────────────────────────────
-
-    def _decode_vector(self, raw, field_type) -> List[float]:
-        if isinstance(raw, list):
-            if len(raw) == 1 and isinstance(raw[0], bytes):
-                raw = raw[0]
-            elif raw and isinstance(raw[0], (int, float)):
-                return raw
-            else:
-                raw = raw[0] if raw else b""
-        if isinstance(raw, bytes):
-            if field_type in (DataType.FLOAT16_VECTOR, "FLOAT16_VECTOR"):
-                return np.frombuffer(raw, dtype=np.float16).astype(np.float32).tolist()
-            if field_type in (DataType.FLOAT_VECTOR, "FLOAT_VECTOR"):
-                return np.frombuffer(raw, dtype=np.float32).tolist()
-            logger.warning(f"Unknown field type {field_type}, attempting float16 decode")
-            return np.frombuffer(raw, dtype=np.float16).astype(np.float32).tolist()
-        return raw
 
     # ── Record conversion ─────────────────────────────────────────────────────
 
@@ -334,10 +345,8 @@ class MilvusBaseSource(BaseSource):
                 # SLOT 0: ID
                 row.set_field(0, str(rec.get(self._schema.fields[0].name, "")))
 
-                # SLOT 1: DENSE VECTOR
-                raw   = rec.get(self._dense_field_name, [])
-                dense = self._decode_vector(raw, self._dense_field_type)
-                row.set_field(self._dense_slot, dense)
+                # SLOT 1: DENSE VECTOR — pass through as-is (no decoding)
+                row.set_field(self._dense_slot, rec.get(self._dense_field_name, []))
 
                 # SLOT 2 (hybrid): SPARSE VECTOR
                 if self._sparse_slot >= 0:
@@ -554,9 +563,7 @@ class MilvusDenseSource(MilvusBaseSource):
             try:
                 row = MigrationRow(self._schema.total_fields)
                 row.set_field(0, str(rec.get(self._schema.fields[0].name, "")))
-                raw   = rec.get(self._dense_field_name, [])
-                dense = self._decode_vector(raw, self._dense_field_type)
-                row.set_field(self._dense_slot, dense)
+                row.set_field(self._dense_slot, rec.get(self._dense_field_name, []))
                 sp = sparse_embs[i]
                 if sp and sp.get("indices"):
                     row.set_field(self._sparse_slot, sp)
