@@ -64,7 +64,7 @@ class BaseSource(ABC):
     #     """
     #     Return an IndexConfig describing the source collection.
     #     Called *after* detect_schema(), so all schema info is available.
-    #     The pipeline passes this to the sink's setup_index().
+    #     The pipeline passes this to the sink's setup_collection().
 
     #     get_index_config() - return IndexConfig the sink will use
     #     """

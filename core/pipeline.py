@@ -158,7 +158,7 @@ class MigrationPipeline:
                     f"hybrid={self._schema.is_hybrid}")
 
         # ── step 3: target uses schema to create index + resolve slots ──────────
-        self.target.setup_index(self._schema)
+        self.target.setup_collection(self._schema)
 
         # ── step 4: data flows ─────────────────────────────────────────────────
         logger.info("=" * 70)

@@ -1,17 +1,19 @@
 """
-    sinks/endee_sink.py
+    targets/endee_target.py
     ============================
-    Endee sink connector — handles both dense-only and hybrid indexes.
+    Endee target connector — handles both dense-only and hybrid collections.
 
-    A single EndeeSink works for both:
-    - Dense  -> IndexConfig.is_hybrid=False -> creates a standard vector index
-    - Hybrid -> IndexConfig.is_hybrid=True  -> creates a hybrid (dense+sparse) index
+    Uses Endee API v2: Database → Collection → Index hierarchy.
 
-    MigrationRow -> Endee native format conversion:
+    A single EndeeTarget works for both:
+    - Dense  -> target_type=dense  -> creates a collection with one vector field
+    - Hybrid -> target_type=hybrid -> creates a collection with vector + sparse fields
+
+    MigrationRow -> Endee native format conversion (v2):
     Dense record:
-        {"id": str, "vector": [...], "filter": {...}, "meta": {...}}
+        {"id": str, "fields": {"embedding": [...]}, "filter": {...}, "meta": {...}}
     Hybrid record:
-        {"id": str, "vector": [...], "sparse_indices": [...], "sparse_values": [...],
+        {"id": str, "fields": {"embedding": [...], "keywords": {"indices": [...], "values": [...]}},
         "filter": {...}, "meta": {...}}
 
     upsert_batch() splits the batch into upsert_chunk_size chunks, sends them
@@ -28,7 +30,7 @@ import urllib.parse
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from endee import Endee
-from endee.exceptions import NotFoundException
+from endee.exceptions import NotFoundException, ConflictException
 
 from core.base_target import BaseTarget
 from core.schema import FieldRole, FieldType, MigrationRow, RowSchema
@@ -101,8 +103,8 @@ class EndeeTarget(BaseTarget):
         self.precision              = precision # CANONICAL PRECISION
         self.target_type            = target_type
 
-        self._client: Any           = None
-        self._index:  Any           = None
+        self._client:      Any      = None
+        self._collection:  Any      = None
 
         self.filter_fields: Set[str] = (
             set(f.strip() for f in filter_fields.split(",") if f.strip())
@@ -127,18 +129,18 @@ class EndeeTarget(BaseTarget):
 
         # ── DEBUG: smoke-test before proceeding ──
         try:
-            self._client.list_indexes()
+            self._client.list_collections()
             logger.info(f"Endee reachable")
         except Exception as e:
             logger.error(f"  Endee unreachable after connect: {e}")
             raise
         logger.info("Connected to Endee")
 
-    # ── setup_index ───────────────────────────────────────────────────────────
+    # ── setup_collection ─────────────────────────────────────────────────────
 
-    def setup_index(self, schema: RowSchema):
+    def setup_collection(self, schema: RowSchema):
         """
-            Creates or gets the Endee index.
+            Creates or gets the Endee collection (v2 API).
             ALL params come from RowSchema — no hardcoded values, no separate IndexConfig.
             Role detection done here once — slots cached for fast row conversion.
         """
@@ -154,11 +156,11 @@ class EndeeTarget(BaseTarget):
                 sys.exit(1)
             logger.info(f"  filter_fields validated: {self.filter_fields}")
 
-        # RESOLVE SLOT POISTIONS
-        pk_field     = schema.get_primary_key()
-        dense_field  = schema.get_dense_vector()
-        sparse_field = schema.get_sparse_vector()
-        meta_fields  = schema.get_metadata_fields()
+        # RESOLVE SLOT POSITIONS
+        pk_field         = schema.get_primary_key()
+        dense_field      = schema.get_dense_vector()
+        sparse_field     = schema.get_sparse_vector()
+        meta_fields      = schema.get_metadata_fields()
         source_precision = schema.canonical_precision
 
         # PRECISION COMPATIBILITY CHECK
@@ -178,13 +180,13 @@ class EndeeTarget(BaseTarget):
 
         self.endee_precision = resolve_precision(CANONICAL_TO_ENDEE_PRECISION, self.precision)
 
-        self.dimension = dense_field.dimension
         # REQUIRED FIELDS
         if pk_field is None:
-            raise ValueError("RowSchema has no PRIMARY_KEY field — cannot create Endee index")
+            raise ValueError("RowSchema has no PRIMARY_KEY field — cannot create Endee collection")
         if dense_field is None:
-            raise ValueError("RowSchema has no DENSE_VECTOR field — cannot create Endee index")
+            raise ValueError("RowSchema has no DENSE_VECTOR field — cannot create Endee collection")
 
+        self.dimension   = dense_field.dimension
         self._pk_slot    = schema.index_of(pk_field.name)
         self._dense_slot = schema.index_of(dense_field.name)
 
@@ -201,58 +203,83 @@ class EndeeTarget(BaseTarget):
         logger.info(f"  Slot map: id={self._pk_slot}, dense={self._dense_slot}, "
                     f"sparse={self._sparse_slot}, meta={self._payload_slots}")
 
-        # NO INDEX - CREATE NEW ONE
+        # COLLECTION ALREADY EXISTS — reuse it
         try:
-            self._index = self._client.get_index(self.index_name)
-            logger.info(f"Index already exists: {self.index_name}")
+            self._collection = self._client.get_collection(self.index_name)
+            logger.info(f"Collection already exists: {self.index_name}")
             return
         except NotFoundException:
             pass
 
-        kwargs = dict(
-            name       = self.index_name,
-            dimension  = self.dimension,         
-            space_type = self.space_type,        # from RowSchema
-            M          = self.M,                 # from RowSchema
-            ef_con     = self.ef_construct,      # from RowSchema
-            precision  = self.endee_precision,         # from RowSchema
-        )
-        if self.target_type == "hybrid":
-            if self.sparse_model:
-                kwargs["sparse_model"] = self.sparse_model
-            else:
-                kwargs["sparse_model"] = DEFAULT_SPARSE_MODEL
-            logger.info(f"Creating HYBRID index '{self.index_name}'")
-        else:
-            logger.info(f"Creating DENSE index '{self.index_name}'")
+        # BUILD FIELD DEFINITIONS FOR v2 create_collection
+        fields = [
+            {
+                "name": "embedding",
+                "type": "vector",
+                "params": {
+                    "dimension":  self.dimension,
+                    "space_type": self.space_type,
+                    "precision":  self.endee_precision,
+                    "M":          self.M,
+                    "ef_con":     self.ef_construct,
+                },
+            }
+        ]
 
-        self._client.create_index(**kwargs)
-        self._index = self._client.get_index(self.index_name)
-        logger.info(f"Created index: {self.index_name}")
+        if self.target_type == "hybrid":
+            sparse_model = self.sparse_model or DEFAULT_SPARSE_MODEL
+            fields.append({
+                "name": "keywords",
+                "type": "sparse",
+                "params": {
+                    "sparse_model": sparse_model,
+                },
+            })
+            logger.info(f"Creating HYBRID collection '{self.index_name}' (sparse_model={sparse_model})")
+        else:
+            logger.info(f"Creating DENSE collection '{self.index_name}'")
+
+        self._client.create_collection(name=self.index_name, fields=fields)
+        self._collection = self._client.get_collection(self.index_name)
+        logger.info(f"Created collection: {self.index_name}")
 
     # ── Record conversion ─────────────────────────────────────────────────────
 
 
     def _to_endee(self, record: MigrationRow, schema: RowSchema) -> dict:
-        """ Convert canonical MigrationRecord to Endee's native dict format.
-            Converts MigrationRow to Endee native dict.
+        """Convert canonical MigrationRow to Endee v2 native dict format.
             Uses pre-resolved slot indexes — NO schema lookups per row (fast).
             Uses FieldRole — NO hardcoded attribute names like row.dense_vector.
             filter_fields split happens HERE — source never knew about it.
-        """
-        
-        # primary key
-        d = {"id": str(record.get_field(self._pk_slot))}
 
-        # dense vector
-        d["vector"] = record.get_field(self._dense_slot)
+            v2 format:
+            {
+                "id": str,
+                "fields": {
+                    "embedding": [...],               # dense
+                    "keywords":  {"indices": [...], "values": [...]}  # sparse (hybrid only)
+                },
+                "filter": {...},
+                "meta":   {...}
+            }
+        """
+        # primary key
+        d: dict = {"id": str(record.get_field(self._pk_slot))}
+
+        # vectors go inside the "fields" dict (v2)
+        vector_fields: dict = {}
+        vector_fields["embedding"] = record.get_field(self._dense_slot)
 
         # sparse vector (hybrid only)
         if self._sparse_slot >= 0:
             sp = record.get_field(self._sparse_slot)
             if sp:
-                d["sparse_indices"] = sp["indices"]
-                d["sparse_values"]  = sp["values"]
+                vector_fields["keywords"] = {
+                    "indices": sp["indices"],
+                    "values":  sp["values"],
+                }
+
+        d["fields"] = vector_fields
 
         # metadata — split payload into filter and meta
         filter_data: dict = {}
@@ -299,7 +326,7 @@ class EndeeTarget(BaseTarget):
         loop   = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: self._index.upsert(chunk),
+            lambda: self._collection.upsert(chunk),
         )
         if not result:
             raise RuntimeError(f"Endee upsert returned falsy for chunk of {len(chunk)} records")

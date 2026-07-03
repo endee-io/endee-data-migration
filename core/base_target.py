@@ -24,7 +24,7 @@ class BaseTarget(ABC):
 
     Lifecycle (called by MigrationPipeline in this order):
         connect()      - establish DB connection
-        setup_index()  - get or create the target index using IndexConfig
+        setup_collection()  - get or create the target index using IndexConfig
         upsert_batch() - called once per batch during the migration loop
 
     upsert_batch() contract
@@ -45,7 +45,7 @@ class BaseTarget(ABC):
         """Establish connection to the target database."""
 
     @abstractmethod
-    def setup_index(self, config: RowSchema) -> None:
+    def setup_collection(self, config: RowSchema) -> None:
         """
         Retrieve or create the target index.
 

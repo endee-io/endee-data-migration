@@ -56,7 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.base_source import BaseSource
 from core.schema import FieldRole, FieldSchema, FieldType, MigrationRow, RowSchema
 from sparse_encoders.factory_sparse_encoder import SparseEncoderFactory
-
+from core.type_registry import PRECISION_FLOAT32
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +82,7 @@ class ChromaBaseSource(BaseSource):
         api_key:                str  = "",
         source_path:            Optional[str] = None,
         store_document_in_meta: bool = True,
-        canonical_precision:    str  = "float32",
+        canonical_precision:    str  = PRECISION_FLOAT32,
     ):
         self.url                    = url
         self.collection             = collection
@@ -387,7 +387,7 @@ class ChromaDenseSource(BaseSource):
         source_path:            Optional[str] = None,
         store_document_in_meta: bool          = True,
         sparse_algo:            Optional[str] = None,
-        canonical_precision:    str           = "float32",
+        canonical_precision:    str           = PRECISION_FLOAT32,
     ):
         self.url                    = url
         self.collection             = collection
@@ -689,5 +689,5 @@ class ChromaDenseSource(BaseSource):
             source_path            = getattr(args, "source_path", None),
             store_document_in_meta = getattr(args, "store_document_in_meta", True),
             sparse_algo            = getattr(args, "sparse_algo", None),
-            canonical_precision    = getattr(args, "precision", "float32") or "float32",
+            # canonical_precision    = "float32",  # ChromaDB always returns float32 embeddings
         )
