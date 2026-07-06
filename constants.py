@@ -34,6 +34,7 @@ ENDEE_SPARSE_VALUES_KEY = "sparse_values"
 # Qdrant hybrid vector field names
 QDRANT_DENSE_VECTOR_NAME = "dense"
 QDRANT_SPARSE_VECTOR_NAME = "sparse_keywords"
+DEFAULT_SPARSE_MODEL = "default"
 
 # API paths
 ENDEE_V1_API = "/api/v1"
