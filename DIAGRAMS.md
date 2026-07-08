@@ -825,7 +825,7 @@
 
   constants.py
   ┌─────────────────────────────────────────────────────────┐
-  │ ENDEE_V1_API         : "/api/v1/"                       │
+  │ ENDEE_V2_API         : "/api/v2/"                       │
   │ DEFAULT_SPARSE_MODEL : "endee_bm25"                     │
   │ HNSW defaults        : M=16, EF_CONSTRUCT=128           │
   └─────────────────────────────────────────────────────────┘

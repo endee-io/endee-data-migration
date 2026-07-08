@@ -35,7 +35,7 @@ from endee.exceptions import NotFoundException, ConflictException
 from core.base_target import BaseTarget
 from core.schema import FieldRole, FieldType, MigrationRow, RowSchema
 import time
-from constants import DEFAULT_SPARSE_MODEL, ENDEE_V1_API
+from constants import DEFAULT_SPARSE_MODEL, ENDEE_V2_API
 from endee import Precision
 from core.type_registry import (
     SPACE_COSINE, SPACE_L2, SPACE_IP,
@@ -57,7 +57,7 @@ CANONICAL_TO_ENDEE_PRECISION: dict[str, Precision] = {
     PRECISION_FLOAT16: Precision.FLOAT16,
     PRECISION_INT16:   Precision.INT16,
     PRECISION_INT8:    Precision.INT8,
-    PRECISION_BINARY:  Precision.BINARY2,
+    PRECISION_BINARY:  Precision.BINARY,
 }
 
 
@@ -123,11 +123,11 @@ class EndeeTarget(BaseTarget):
         logger.info("Connecting to Endee...")
         self._client = Endee(token=self.endee_api_key)
         if self.endee_url:
-            url = urllib.parse.urljoin(self.endee_url, ENDEE_V1_API)
+            url = urllib.parse.urljoin(self.endee_url, ENDEE_V2_API)
             self._client.set_base_url(url)
             logger.info(f"  Base URL: {url}")
 
-        # ── DEBUG: smoke-test before proceeding ──
+        # - DEBUG: smoke-test before proceeding -
         try:
             self._client.list_collections()
             logger.info(f"Endee reachable")
